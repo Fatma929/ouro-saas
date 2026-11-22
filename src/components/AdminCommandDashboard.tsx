@@ -60,9 +60,13 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
-  // KYC & 3PL Verification state
+  // KYC, Generator Verification, 3PL & Stage 7 Recycling Verifier state
   const [reviewReasons, setReviewReasons] = useState<Record<number, string>>({});
   const [kycBusyId, setKycBusyId] = useState<number | null>(null);
+  const [hubVerifyReasons, setHubVerifyReasons] = useState<Record<number, string>>({});
+  const [hubVerifyBusyId, setHubVerifyBusyId] = useState<number | null>(null);
+  const [recyclingReasons, setRecyclingReasons] = useState<Record<number, string>>({});
+  const [recyclingBusyId, setRecyclingBusyId] = useState<number | null>(null);
   const [providerReasons, setProviderReasons] = useState<Record<number, string>>({});
   const [providerBusyId, setProviderBusyId] = useState<number | null>(null);
 
@@ -78,8 +82,9 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
   >({});
   const [factorBusyCat, setFactorBusyCat] = useState<string | null>(null);
 
-  // Waste Generators Directory view mode
+  // Waste Generators Directory view mode & search
   const [generatorView, setGeneratorView] = useState<'table' | 'grid'>('table');
+  const [generatorSearch, setGeneratorSearch] = useState('');
   const [dispatchBusyId, setDispatchBusyId] = useState<number | null>(null);
 
   // Register New Waste Generator Modal
@@ -173,6 +178,56 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
       setError(err.message || '3PL verification update failed.');
     } finally {
       setProviderBusyId(null);
+    }
+  };
+
+  const handleHubVerificationDecision = async (hubId: number, status: 'verified' | 'suspended') => {
+    const reason = (hubVerifyReasons[hubId] || '').trim();
+    if (reason.length < 5) {
+      setError('Please enter an audit review note (at least 5 characters) before verifying a Waste Generator.');
+      return;
+    }
+    setHubVerifyBusyId(hubId);
+    setError(null);
+    try {
+      await apiFetch(`/api/admin/hubs/${hubId}/verify`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status, reason }),
+      });
+      setToast(`Waste Generator verification updated to ${status.toUpperCase()} and audited.`);
+      await loadOverview();
+    } catch (err: any) {
+      setError(err.message || 'Generator verification update failed.');
+    } finally {
+      setHubVerifyBusyId(null);
+    }
+  };
+
+  const handleVerifyRecyclingDecision = async (reservationId: number, decision: 'approved' | 'rejected') => {
+    const reason = (recyclingReasons[reservationId] || '').trim();
+    if (reason.length < 5) {
+      setError('Please enter a verifier audit note (at least 5 characters) before approving or rejecting Stage 7.');
+      return;
+    }
+    setRecyclingBusyId(reservationId);
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/reservations/${reservationId}/verify-recycling`, {
+        method: 'POST',
+        body: JSON.stringify({ decision, reason }),
+      });
+      if (decision === 'approved') {
+        setToast(
+          `Stage 7 RECYCLED sealed for ${res.passport?.passportCode}: ${res.impact?.recoveredTons} t recovered · ${res.impact?.netVerifiedCo2eTons} tCO2e verified.`
+        );
+      } else {
+        setToast('Recycling evidence rejected and recycling facility notified for resubmission.');
+      }
+      await loadOverview();
+    } catch (err: any) {
+      setError(err.message || 'Recycling verification decision failed.');
+    } finally {
+      setRecyclingBusyId(null);
     }
   };
 
@@ -468,7 +523,14 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
       <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-xl bg-slate-200/70">
         {[
           { id: 'analytics', label: t.admin.overviewTab },
-          { id: 'kyc', label: `KYC & 3PL Verification (${kpis?.pendingFactories ?? 0})` },
+          {
+            id: 'kyc',
+            label: `Verification & ESG Approvals (${
+              (kpis?.pendingFactories ?? 0) +
+              (kpis?.pendingGenerators ?? 0) +
+              (kpis?.pendingRecyclingReviewsCount ?? 0)
+            })`,
+          },
           { id: 'hubs', label: `${t.admin.hubsTab} (${data?.hubs?.length ?? 0})` },
           { id: 'disputes', label: `Disputes Desk (${kpis?.openDisputesCount ?? 0})` },
           { id: 'governance', label: 'Users, ESG Factors & Health' },
@@ -584,9 +646,181 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
         </div>
       )}
 
-      {/* TAB 2: FACTORY KYC & EXTERNAL 3PL PROVIDER VERIFICATION */}
+      {/* TAB 2: STAGE 7 RECYCLING VERIFICATION, FACTORY KYC, GENERATOR VERIFICATION & 3PL */}
       {tab === 'kyc' && data && (
         <div className="space-y-6">
+          {/* Independent Verifier Queue: Stage 7 Recycling Evidence Approval */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-bold text-[#272F31]">
+                Stage 7 Recycling Evidence Verification Queue ({(data.pendingRecyclingReviews || []).length})
+              </h2>
+              <span className="text-xs text-slate-500">
+                Independent sign-off required before sealing Verified Net CO2e
+              </span>
+            </div>
+            {(data.pendingRecyclingReviews || []).length === 0 ? (
+              <div className="rounded-xl bg-white border border-slate-200 p-4 text-xs text-slate-500">
+                No recycling submissions awaiting independent verifier review.
+              </div>
+            ) : (
+              (data.pendingRecyclingReviews || []).map((item: any) => (
+                <div
+                  key={item.id}
+                  className="rounded-2xl bg-white border border-emerald-200 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                >
+                  <div className="space-y-1.5">
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-bold text-amber-700">SUBMITTED FOR VERIFICATION</span>
+                      <span className="text-slate-400">·</span>
+                      <button
+                        type="button"
+                        onClick={() => onInspectPassport(item.passportCode)}
+                        className="font-mono font-bold text-emerald-700 hover:underline"
+                      >
+                        {item.passportCode}
+                      </button>
+                      <span className="text-slate-400">·</span>
+                      <span className="font-mono text-slate-600">{item.reservationCode}</span>
+                    </div>
+                    <h3 className="text-base font-bold text-[#272F31]">
+                      {item.factoryNameEn} ← {item.hubNameEn}
+                    </h3>
+                    <p className="text-xs font-mono text-slate-700">
+                      Recovered: <strong className="text-emerald-700">{item.recoveredTons} t</strong> · Residual:{' '}
+                      {item.residualTons} t · Loss: {item.lossTons} t · Est. Net CO2e:{' '}
+                      <strong>{item.estimatedCo2eTons} tCO2e</strong>
+                    </p>
+                    {item.recyclingNotes && (
+                      <p className="text-xs text-slate-600 italic">Factory Notes: {item.recyclingNotes}</p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-3 pt-1">
+                      {item.weighbridgeFileId && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleInspectKycDoc(
+                              item.weighbridgeFileId,
+                              item.weighbridgeFileName || 'Weighbridge_Ticket.pdf'
+                            )
+                          }
+                          className="inline-flex items-center gap-1 text-xs font-semibold text-amber-800 hover:underline"
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>Weighbridge Ticket ({item.weighbridgeFileName || 'View'})</span>
+                        </button>
+                      )}
+                      {item.recyclingEvidenceFileId && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleInspectKycDoc(
+                              item.recyclingEvidenceFileId,
+                              item.recyclingEvidenceName || 'Recycling_Evidence.pdf'
+                            )
+                          }
+                          className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:underline"
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>Recycling Proof ({item.recyclingEvidenceName || 'View'})</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="w-full lg:w-96 space-y-2">
+                    <input
+                      type="text"
+                      value={recyclingReasons[item.id] || ''}
+                      onChange={(e) => setRecyclingReasons((prev) => ({ ...prev, [item.id]: e.target.value }))}
+                      placeholder="Mandatory verifier note (e.g. Mass balance & batch cert verified)"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-[#272F31]"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={recyclingBusyId === item.id}
+                        onClick={() => handleVerifyRecyclingDecision(item.id, 'approved')}
+                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-3 py-2 text-xs font-semibold text-white min-h-[38px]"
+                      >
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Approve &amp; Seal Stage 7</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={recyclingBusyId === item.id}
+                        onClick={() => handleVerifyRecyclingDecision(item.id, 'rejected')}
+                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg border border-red-300 bg-red-50 hover:bg-red-100 px-3 py-2 text-xs font-semibold text-red-700 min-h-[38px]"
+                      >
+                        <XCircle className="w-3.5 h-3.5" />
+                        <span>Reject</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Pending Waste Generator Facility Onboarding Queue */}
+          {(data.hubs || []).some((h: any) => h.verificationStatus !== 'verified') && (
+            <div className="space-y-3">
+              <h2 className="text-sm font-bold text-[#272F31]">Waste Generator Facility Verification Queue</h2>
+              {(data.hubs || [])
+                .filter((h: any) => h.verificationStatus !== 'verified')
+                .map((h: any) => (
+                  <div
+                    key={h.id}
+                    className="rounded-2xl bg-white border border-amber-200 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-bold text-amber-700">
+                          STATUS: {String(h.verificationStatus).toUpperCase()}
+                        </span>
+                        <span className="text-slate-400">·</span>
+                        <span className="font-mono font-bold text-[#272F31]">{h.code}</span>
+                        <span className="text-slate-400">·</span>
+                        <span>{h.governorate}</span>
+                      </div>
+                      <h3 className="text-base font-bold text-[#272F31]">{h.nameEn}</h3>
+                      <p className="text-xs text-slate-600 font-mono">
+                        CR: <strong>{h.commercialRegNo || 'N/A'}</strong> · Phone: {h.contactPhone || 'N/A'} ·{' '}
+                        {h.address}
+                      </p>
+                    </div>
+                    <div className="w-full lg:w-96 space-y-2">
+                      <input
+                        type="text"
+                        value={hubVerifyReasons[h.id] || ''}
+                        onChange={(e) => setHubVerifyReasons((prev) => ({ ...prev, [h.id]: e.target.value }))}
+                        placeholder="Mandatory audit note (e.g. Verified commercial registration)"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-[#272F31]"
+                      />
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={hubVerifyBusyId === h.id}
+                          onClick={() => handleHubVerificationDecision(h.id, 'verified')}
+                          className="flex-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-3 py-2 text-xs font-semibold text-white min-h-[38px]"
+                        >
+                          Approve Generator
+                        </button>
+                        <button
+                          type="button"
+                          disabled={hubVerifyBusyId === h.id}
+                          onClick={() => handleHubVerificationDecision(h.id, 'suspended')}
+                          className="flex-1 rounded-lg border border-red-300 bg-red-50 hover:bg-red-100 px-3 py-2 text-xs font-semibold text-red-700 min-h-[38px]"
+                        >
+                          Suspend
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          )}
+
           <div className="space-y-3">
             <h2 className="text-sm font-bold text-[#272F31]">Recycling Factory KYC Approval Queue</h2>
             {data.factories.map((fac: any) => (
@@ -746,27 +980,36 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
                 </div>
               ))}
             </div>
-            <div className="inline-flex items-center p-1 rounded-lg bg-slate-100">
-              <button
-                type="button"
-                onClick={() => setGeneratorView('table')}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold ${
-                  generatorView === 'table' ? 'bg-white text-[#272F31] shadow-xs' : 'text-slate-600 hover:text-[#272F31]'
-                }`}
-              >
-                <TableIcon className="w-3.5 h-3.5" />
-                <span>Table</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setGeneratorView('grid')}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold ${
-                  generatorView === 'grid' ? 'bg-white text-[#272F31] shadow-xs' : 'text-slate-600 hover:text-[#272F31]'
-                }`}
-              >
-                <LayoutGrid className="w-3.5 h-3.5" />
-                <span>Grid</span>
-              </button>
+            <div className="flex items-center gap-2.5">
+              <input
+                type="text"
+                value={generatorSearch}
+                onChange={(e) => setGeneratorSearch(e.target.value)}
+                placeholder={lang === 'ar' ? 'بحث بالكود أو الاسم...' : 'Search code, facility, governorate...'}
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs text-[#272F31] w-52 focus:border-emerald-600 focus:outline-none"
+              />
+              <div className="inline-flex items-center p-1 rounded-lg bg-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setGeneratorView('table')}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold ${
+                    generatorView === 'table' ? 'bg-white text-[#272F31] shadow-xs' : 'text-slate-600 hover:text-[#272F31]'
+                  }`}
+                >
+                  <TableIcon className="w-3.5 h-3.5" />
+                  <span>Table</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGeneratorView('grid')}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold ${
+                    generatorView === 'grid' ? 'bg-white text-[#272F31] shadow-xs' : 'text-slate-600 hover:text-[#272F31]'
+                  }`}
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" />
+                  <span>Grid</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -784,10 +1027,28 @@ export const AdminCommandDashboard: React.FC<AdminCommandDashboardProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {data.hubs.map((h: any) => (
+                  {(data.hubs || [])
+                    .filter((h: any) => {
+                      const q = generatorSearch.trim().toLowerCase();
+                      if (!q) return true;
+                      return (
+                        String(h.code).toLowerCase().includes(q) ||
+                        String(h.nameEn).toLowerCase().includes(q) ||
+                        String(h.nameAr || '').toLowerCase().includes(q) ||
+                        String(h.governorate).toLowerCase().includes(q)
+                      );
+                    })
+                    .map((h: any) => (
                     <tr key={h.id} className="hover:bg-slate-50/70">
                       <td className="py-3.5 px-4">
-                        <div className="font-mono font-bold text-[#272F31]">{h.code}</div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-[#272F31]">{h.code}</span>
+                          {h.verificationStatus !== 'verified' && (
+                            <span className="text-[10px] font-bold uppercase text-amber-700">
+                              [{h.verificationStatus}]
+                            </span>
+                          )}
+                        </div>
                         <div className="font-semibold text-slate-800">{h.nameEn}</div>
                       </td>
                       <td className="py-3.5 px-4">

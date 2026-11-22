@@ -256,7 +256,11 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
                           <span>{item.hubNameEn} → {item.factoryNameEn}</span>
                         </div>
                         <div className="font-mono tabular-nums text-amber-900">
-                          {item.deliveredTons.toFixed(2)} t delivered · Est. potential ~{Number(item.estimatedCo2eTons || 0).toFixed(2)} tCO2e (unverified)
+                          {item.deliveredTons.toFixed(2)} t delivered ·{' '}
+                          {item.recyclingStatus === 'submitted_for_verification'
+                            ? 'Submitted (Awaiting Verifier Approval)'
+                            : 'Pending Recycling Proof'}{' '}
+                          · Est. ~{Number(item.estimatedCo2eTons || 0).toFixed(2)} tCO2e (unverified)
                         </div>
                       </div>
                     ))}
@@ -264,20 +268,36 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
                 </div>
               )}
 
-              {/* Explicit Methodology & Boundary Disclosures */}
+              {/* Explicit Methodology, Geographic Boundaries & Limitations Disclosures */}
               <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
                 <div>
                   <h3 className="text-xs font-bold text-[#272F31]">
-                    Methodology, System Boundaries & Emission Factor Disclosures
+                    Methodology, System Boundaries &amp; Scientific Limitation Disclosures
                   </h3>
                   {report.methodologyDisclosure && (
-                    <div className="mt-1.5 space-y-1 text-[11px] text-slate-600">
+                    <div className="mt-1.5 space-y-1.5 text-[11px] text-slate-600">
                       <p>
                         <strong>Accounting Rule:</strong> {report.methodologyDisclosure.accountingPrinciple}
                       </p>
                       <p className="font-mono text-[11px] text-[#272F31]">
                         {report.methodologyDisclosure.formula}
                       </p>
+                      {report.methodologyDisclosure.limitations && (
+                        <div className="pt-1 space-y-1 text-[11px] text-slate-600 border-t border-slate-200">
+                          <p>
+                            <strong>Geographic &amp; Grid Proxy Limitation:</strong>{' '}
+                            {report.methodologyDisclosure.limitations.geographicScope}
+                          </p>
+                          <p>
+                            <strong>Transport Distance Basis:</strong>{' '}
+                            {report.methodologyDisclosure.limitations.transportAssumption}
+                          </p>
+                          <p>
+                            <strong>Independent Verification Requirement:</strong>{' '}
+                            {report.methodologyDisclosure.limitations.verifierRequirement}
+                          </p>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

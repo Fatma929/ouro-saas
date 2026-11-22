@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { asc, count, desc, eq, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, isNull, or, sql } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import {
   adminAuditLogs,
@@ -17,7 +17,9 @@ import {
 } from '../db/schema.ts';
 import { requireAuth, requireRole, type AuthRequest } from '../middleware/auth.ts';
 import { dispatchNotification, getEmailProviderStatus, notifyOrganization } from '../lib/notifications.ts';
-import { DISPUTE_CATEGORIES, VEHICLE_TYPES, type UserRole } from '../shared/constants.ts';
+import { appendHashedPassportEvents } from '../lib/passport-chain.ts';
+import { calculateVerifiedRecyclingImpact, getEmissionFactorForCategory } from '../lib/esg-engine.ts';
+import { DISPUTE_CATEGORIES, VEHICLE_TYPES, haversineKm, type UserRole } from '../shared/constants.ts';
 
 export const platformRouter = Router();
 
@@ -109,10 +111,16 @@ platformRouter.get('/api/notifications', requireAuth, async (req: AuthRequest, r
   try {
     const userId = req.authUser!.id;
     const role = req.authUser!.role;
+    // Strict user-level isolation: return only notifications addressed to this user OR role-wide broadcasts (userId IS NULL)
     const rows = await db
       .select()
       .from(notifications)
-      .where(or(eq(notifications.userId, userId), eq(notifications.targetRole, role)))
+      .where(
+        or(
+          eq(notifications.userId, userId),
+          and(isNull(notifications.userId), eq(notifications.targetRole, role))
+        )
+      )
       .orderBy(desc(notifications.createdAt))
       .limit(35);
 
@@ -139,7 +147,9 @@ platformRouter.patch('/api/notifications/:id/read', requireAuth, async (req: Aut
       return res.status(404).json({ error: 'Notification not found.' });
     }
     const n = existing[0];
-    if (n.userId !== req.authUser!.id && n.targetRole !== req.authUser!.role) {
+    const isOwner = n.userId === req.authUser!.id;
+    const isRoleBroadcast = n.userId === null && n.targetRole === req.authUser!.role;
+    if (!isOwner && !isRoleBroadcast) {
       return res.status(403).json({ error: 'Forbidden' });
     }
     const [updated] = await db
@@ -159,7 +169,12 @@ platformRouter.post('/api/notifications/read-all', requireAuth, async (req: Auth
     await db
       .update(notifications)
       .set({ isRead: true })
-      .where(or(eq(notifications.userId, req.authUser!.id), eq(notifications.targetRole, req.authUser!.role)));
+      .where(
+        or(
+          eq(notifications.userId, req.authUser!.id),
+          and(isNull(notifications.userId), eq(notifications.targetRole, req.authUser!.role))
+        )
+      );
     return res.json({ ok: true });
   } catch (error) {
     console.error('Read-all notifications error:', error);
@@ -446,6 +461,300 @@ platformRouter.patch(
       }
       console.error('Verify 3PL provider error:', error);
       return res.status(500).json({ error: 'Failed to update 3PL provider verification.' });
+    }
+  }
+);
+
+platformRouter.patch(
+  '/api/admin/hubs/:id/verify',
+  requireAuth,
+  requireRole('platform_admin'),
+  async (req: AuthRequest, res) => {
+    try {
+      const hubId = Number(req.params.id);
+      const { status, reason } = req.body || {};
+      if (!Number.isInteger(hubId) || hubId <= 0) {
+        return res.status(400).json({ error: 'Invalid Waste Generator facility ID.' });
+      }
+      if (!['verified', 'suspended', 'pending'].includes(status)) {
+        return res.status(400).json({ error: 'Status must be verified, suspended, or pending.' });
+      }
+      if (!reason || String(reason).trim().length < 5) {
+        return res.status(400).json({ error: 'Mandatory audit review note (min 5 characters) is required.' });
+      }
+
+      const updated = await db.transaction(async (tx) => {
+        const [hub] = await tx
+          .update(wasteSourceHubs)
+          .set({
+            verificationStatus: status,
+            isActive: status !== 'suspended',
+          })
+          .where(eq(wasteSourceHubs.id, hubId))
+          .returning();
+
+        if (!hub) throw new Error('HUB_NOT_FOUND');
+
+        await tx.insert(adminAuditLogs).values({
+          action: `GENERATOR_${String(status).toUpperCase()}`,
+          targetType: 'waste_generator',
+          targetId: String(hub.id),
+          actorEmail: req.authUser!.email,
+          reason: `${hub.nameEn} (${hub.code}): ${String(reason).trim()}`,
+        });
+
+        await notifyOrganization(
+          { hubId: hub.id },
+          {
+            type: 'kyc',
+            titleEn: `Facility Verification Updated: ${status.toUpperCase()}`,
+            titleAr: `تحديث اعتماد المنشأة المولدة: ${status}`,
+            messageEn: String(reason).trim(),
+            messageAr: String(reason).trim(),
+            entityType: 'waste_generator',
+            entityId: String(hub.id),
+          },
+          tx
+        );
+
+        return hub;
+      });
+
+      return res.json({ hub: updated });
+    } catch (error: any) {
+      if (error?.message === 'HUB_NOT_FOUND') {
+        return res.status(404).json({ error: 'Waste Generator facility not found.' });
+      }
+      console.error('Verify generator hub error:', error);
+      return res.status(500).json({ error: 'Failed to update Waste Generator verification status.' });
+    }
+  }
+);
+
+platformRouter.post(
+  '/api/admin/reservations/:id/verify-recycling',
+  requireAuth,
+  requireRole('platform_admin'),
+  async (req: AuthRequest, res) => {
+    try {
+      const resId = Number(req.params.id);
+      const { decision, reason } = req.body || {};
+
+      if (!Number.isInteger(resId) || resId <= 0) {
+        return res.status(400).json({ error: 'Invalid reservation ID.' });
+      }
+      if (decision !== 'approved' && decision !== 'rejected') {
+        return res.status(400).json({ error: 'Decision must be "approved" or "rejected".' });
+      }
+      if (!reason || String(reason).trim().length < 5) {
+        return res.status(400).json({ error: 'Mandatory verifier audit note (min 5 characters) is required.' });
+      }
+
+      const cleanReason = String(reason).trim().slice(0, 800);
+
+      const result = await db.transaction(async (tx) => {
+        await tx.execute(sql`SELECT id FROM reservations WHERE id = ${resId} FOR UPDATE`);
+        const rows = await tx.select().from(reservations).where(eq(reservations.id, resId)).limit(1);
+        if (rows.length === 0) throw new Error('RESERVATION_NOT_FOUND');
+        const current = rows[0];
+
+        if (current.pickupStatus !== 'delivered') throw new Error('NOT_YET_DELIVERED');
+        if (current.recyclingStatus === 'verified_recycled') throw new Error('ALREADY_VERIFIED');
+        if (current.recyclingStatus !== 'submitted_for_verification' || current.recoveredTons <= 0) {
+          throw new Error('NO_EVIDENCE_SUBMITTED');
+        }
+
+        await tx.execute(sql`SELECT id FROM waste_passports WHERE id = ${current.passportId} FOR UPDATE`);
+        const [passport] = await tx
+          .select()
+          .from(wastePassports)
+          .where(eq(wastePassports.id, current.passportId))
+          .limit(1);
+        const [hub] = await tx
+          .select()
+          .from(wasteSourceHubs)
+          .where(eq(wasteSourceHubs.id, current.hubId))
+          .limit(1);
+        const [factory] = await tx
+          .select()
+          .from(recyclingFactories)
+          .where(eq(recyclingFactories.id, current.factoryId))
+          .limit(1);
+
+        if (decision === 'rejected') {
+          const [rejectedRes] = await tx
+            .update(reservations)
+            .set({
+              recyclingStatus: 'verification_rejected',
+              co2eAvoidedTons: 0,
+              esgConfidenceLevel: 'estimated',
+              updatedAt: new Date(),
+            })
+            .where(eq(reservations.id, current.id))
+            .returning();
+
+          await appendHashedPassportEvents(tx, passport.id, [
+            {
+              stage: 6,
+              eventType: 'RECYCLING_VERIFICATION_REJECTED',
+              actorName: req.authUser!.fullName,
+              actorRole: 'platform_admin',
+              summaryEn: `Stage 7 recycling submission rejected by verifier (${req.authUser!.email}): ${cleanReason}. Passport remains DELIVERED pending resubmission.`,
+              summaryAr: `تم رفض مستندات إعادة التدوير من قبل المراجع المعتمد: ${cleanReason}. الحالة تبقى "تم التسليم" لحين إعادة التقديم.`,
+              metadataJson: JSON.stringify({ reservationCode: current.reservationCode, reason: cleanReason }),
+            },
+          ]);
+
+          await tx.insert(adminAuditLogs).values({
+            action: 'RECYCLING_VERIFICATION_REJECTED',
+            targetType: 'reservation',
+            targetId: String(current.id),
+            actorEmail: req.authUser!.email,
+            reason: `${current.reservationCode} (${passport.passportCode}): ${cleanReason}`,
+          });
+
+          await notifyOrganization(
+            { factoryId: factory.id },
+            {
+              type: 'recycling',
+              titleEn: `Recycling Evidence Rejected (${current.reservationCode})`,
+              titleAr: `تم رفض إثبات إعادة التدوير (${current.reservationCode})`,
+              messageEn: `Verifier note: ${cleanReason}. Please upload corrected recycling evidence.`,
+              messageAr: `ملاحظة المراجع: ${cleanReason}. يرجى إعادة رفع إثبات التدوير.`,
+              entityType: 'passport',
+              entityId: passport.passportCode,
+            },
+            tx
+          );
+
+          return { reservation: rejectedRes, passport, impact: null };
+        }
+
+        // Approved by independent verifier -> seal Stage 7 RECYCLED & verified net CO2e!
+        const deliveredTonsBasis = current.receivedWeightKg
+          ? Number((current.receivedWeightKg / 1000).toFixed(3))
+          : current.handoffWeightKg
+          ? Number((current.handoffWeightKg / 1000).toFixed(3))
+          : current.quantityTons;
+
+        const factor = await getEmissionFactorForCategory(passport.materialCategory);
+        const distanceKm =
+          current.transportDistanceKm > 0
+            ? current.transportDistanceKm
+            : Number(haversineKm(hub.lat, hub.lng, factory.lat, factory.lng).toFixed(1));
+
+        const impact = calculateVerifiedRecyclingImpact({
+          recoveredTons: current.recoveredTons,
+          deliveredTons: deliveredTonsBasis,
+          residualTons: current.residualTons,
+          lossTons: current.lossTons,
+          transportDistanceKm: distanceKm,
+          factor,
+          hasWeighbridgeTicket: Boolean(current.weighbridgeFileId && current.receivedWeightKg),
+          hasRecyclingEvidence: Boolean(current.recyclingEvidenceFileId),
+          verifierApproved: true,
+        });
+
+        const [approvedRes] = await tx
+          .update(reservations)
+          .set({
+            recyclingStatus: 'verified_recycled',
+            recycledAt: new Date(),
+            transportDistanceKm: impact.transportDistanceKm,
+            transportEmissionsTons: impact.transportEmissionsTons,
+            co2eAvoidedTons: impact.netVerifiedCo2eTons,
+            esgConfidenceLevel: impact.confidenceLevel,
+            updatedAt: new Date(),
+          })
+          .where(eq(reservations.id, current.id))
+          .returning();
+
+        const nextRecycledTons = Number((passport.recycledTons + impact.recoveredTons).toFixed(3));
+        const nextResidualTons = Number((passport.residualTons + impact.residualTons).toFixed(3));
+        const nextRejectedTons = Number((passport.rejectedTons + impact.lossTons).toFixed(3));
+        const nextVerifiedCo2e = Number((passport.verifiedCo2eTons + impact.netVerifiedCo2eTons).toFixed(3));
+
+        const [savedPassport] = await tx
+          .update(wastePassports)
+          .set({
+            recycledTons: nextRecycledTons,
+            residualTons: nextResidualTons,
+            rejectedTons: nextRejectedTons,
+            verifiedCo2eTons: nextVerifiedCo2e,
+            emissionFactorVersion: impact.factorVersion,
+            currentStage: 7,
+            status: 'recycled',
+            lifecycleStatus: 'RECYCLED',
+            updatedAt: new Date(),
+          })
+          .where(eq(wastePassports.id, passport.id))
+          .returning();
+
+        await appendHashedPassportEvents(tx, passport.id, [
+          {
+            stage: 7,
+            eventType: 'RECYCLING_VERIFIED_ESG',
+            actorName: `${req.authUser!.fullName} (OURO Verifier)`,
+            actorRole: 'platform_admin',
+            summaryEn: `Verifier approved Stage 7 recycling outcome for ${factory.nameEn}: ${impact.recoveredTons.toFixed(2)} t recovered (${impact.recoveryYieldPct}% yield), ${impact.residualTons.toFixed(2)} t residual, ${impact.lossTons.toFixed(2)} t loss. Net GHG avoided: ${impact.netVerifiedCo2eTons.toFixed(2)} tCO2e (Gross ${impact.grossRecyclingCo2eTons.toFixed(2)} - Road-Adjusted Freight ${impact.transportEmissionsTons.toFixed(3)} tCO2e; Tier: ${impact.confidenceLevel.toUpperCase()}). Note: ${cleanReason}`,
+            summaryAr: `اعتمد المراجع المستقل المرحلة 7 لإعادة التدوير في ${factory.nameAr}: ${impact.recoveredTons.toFixed(2)} طن مستردة (${impact.recoveryYieldPct}%). صافي الانبعاثات المتجنبة: ${impact.netVerifiedCo2eTons.toFixed(2)} طن CO2e.`,
+            metadataJson: JSON.stringify({ ...impact, verifierEmail: req.authUser!.email, verifierNote: cleanReason }),
+            evidenceFileId: current.recyclingEvidenceFileId,
+            lat: factory.lat,
+            lng: factory.lng,
+          },
+        ]);
+
+        await tx.insert(adminAuditLogs).values({
+          action: 'RECYCLING_VERIFICATION_APPROVED',
+          targetType: 'reservation',
+          targetId: String(current.id),
+          actorEmail: req.authUser!.email,
+          reason: `${current.reservationCode} (${passport.passportCode}): ${impact.recoveredTons}t recovered, ${impact.netVerifiedCo2eTons} tCO2e (${impact.confidenceLevel}). ${cleanReason}`,
+        });
+
+        await notifyOrganization(
+          { hubId: current.hubId },
+          {
+            type: 'recycling',
+            titleEn: `Stage 7 Recycling Verified (${passport.passportCode})`,
+            titleAr: `اعتماد إعادة التدوير — المرحلة 7 (${passport.passportCode})`,
+            messageEn: `Verifier sealed ${impact.recoveredTons.toFixed(2)} t recovered output (${impact.netVerifiedCo2eTons.toFixed(2)} tCO2e net avoided).`,
+            messageAr: `تم اعتماد استرداد ${impact.recoveredTons.toFixed(2)} طن وتجنب ${impact.netVerifiedCo2eTons.toFixed(2)} طن CO2e.`,
+            entityType: 'passport',
+            entityId: passport.passportCode,
+          },
+          tx
+        );
+
+        await notifyOrganization(
+          { factoryId: factory.id },
+          {
+            type: 'recycling',
+            titleEn: `Stage 7 ESG Certificate Sealed (${passport.passportCode})`,
+            titleAr: `تم اعتماد شهادة التدوير البيئي (${passport.passportCode})`,
+            messageEn: `Verifier approved ${impact.recoveredTons.toFixed(2)} t recovered output (${impact.netVerifiedCo2eTons.toFixed(2)} tCO2e net).`,
+            messageAr: `تم اعتماد مخرجات التدوير (${impact.recoveredTons.toFixed(2)} طن) وإضافتها لشهادة ESG.`,
+            entityType: 'passport',
+            entityId: passport.passportCode,
+          },
+          tx
+        );
+
+        return { reservation: approvedRes, passport: savedPassport, impact };
+      });
+
+      return res.json(result);
+    } catch (error: any) {
+      const msg = String(error?.message || '');
+      if (msg === 'RESERVATION_NOT_FOUND') return res.status(404).json({ error: 'Reservation not found.' });
+      if (msg === 'NOT_YET_DELIVERED') return res.status(409).json({ error: 'Shipment has not been delivered yet.' });
+      if (msg === 'ALREADY_VERIFIED') return res.status(409).json({ error: 'Recycling outcome is already verified.' });
+      if (msg === 'NO_EVIDENCE_SUBMITTED') {
+        return res.status(409).json({ error: 'No recycling evidence submission is pending verification for this shipment.' });
+      }
+      console.error('Admin verify recycling error:', error);
+      return res.status(500).json({ error: 'Failed to process recycling verification decision.' });
     }
   }
 );

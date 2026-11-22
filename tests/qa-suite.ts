@@ -5,6 +5,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { calculateVerifiedRecyclingImpact, DEFAULT_EMISSION_FACTORS } from '../src/lib/esg-engine.ts';
 
 const BASE_URL = process.env.QA_BASE_URL || 'http://localhost:3000';
 
@@ -525,8 +526,8 @@ async function main() {
     );
     assert.equal(recUpload.status, 201, `Recycling evidence upload failed: ${recUpload.text}`);
 
-    // Submit valid Stage 7 verified recycling outcome (1.82t recovered + 0.12t residual + 0.04t loss = 1.98t)
-    const recycleRes = await req(`/api/reservations/${activeResId}/recycle`, {
+    // Submit valid Stage 7 recycling evidence as Factory (2-step governance: enters 'submitted_for_verification', stays Stage 6 DELIVERED!)
+    const recycleSubmitRes = await req(`/api/reservations/${activeResId}/recycle`, {
       method: 'POST',
       token: factoryApproved.token,
       body: {
@@ -535,17 +536,73 @@ async function main() {
         lossTons: 0.04,
         recyclingEvidenceFileId: recUpload.body.id,
         recyclingEvidenceName: recUpload.body.originalName,
-        recyclingNotes: 'Hot-washed food-grade rPET flake batch verified by QC lab.',
+        recyclingNotes: 'Hot-washed food-grade rPET flake batch submitted for independent verification.',
       },
     });
-    assert.equal(recycleRes.status, 200, `Recycle verify failed: ${recycleRes.text}`);
-    assert.equal(recycleRes.body.passport.lifecycleStatus, 'RECYCLED');
-    assert.equal(recycleRes.body.passport.currentStage, 7);
-    assert.equal(recycleRes.body.reservation.esgConfidenceLevel, 'verified');
-    assert.ok(recycleRes.body.impact.transportEmissionsTons >= 0);
+    assert.equal(recycleSubmitRes.status, 200, `Recycle evidence submit failed: ${recycleSubmitRes.text}`);
+    assert.equal(recycleSubmitRes.body.verificationPending, true);
+    assert.equal(recycleSubmitRes.body.reservation.recyclingStatus, 'submitted_for_verification');
+    assert.equal(recycleSubmitRes.body.reservation.co2eAvoidedTons, 0);
+    assert.equal(recycleSubmitRes.body.passport.lifecycleStatus, 'DELIVERED');
+    assert.equal(recycleSubmitRes.body.passport.currentStage, 6);
+    assert.equal(recycleSubmitRes.body.passport.verifiedCo2eTons, 0);
+
+    // Confirm unverified submission does NOT yet inflate ESG verified totals
+    const esgBeforeApproval = await req('/api/esg/report', { token: admin.token });
+    assert.equal(esgBeforeApproval.status, 200);
     assert.ok(
-      recycleRes.body.impact.netVerifiedCo2eTons < recycleRes.body.impact.grossRecyclingCo2eTons + 0.001,
-      'Net CO2e must account for freight transport deduction'
+      !esgBeforeApproval.body.items.some((i: any) => i.passportCode === racePassportCode),
+      'Unverified factory submission must NOT appear in verified Stage 7 ESG totals'
+    );
+
+    // Independent Admin/Verifier rejects once -> stays DELIVERED with 0 CO2e
+    const rejectRes = await req(`/api/admin/reservations/${activeResId}/verify-recycling`, {
+      method: 'POST',
+      token: admin.token,
+      body: {
+        decision: 'rejected',
+        reason: 'QA verifier check: request clearer batch QC stamp before sealing Stage 7.',
+      },
+    });
+    assert.equal(rejectRes.status, 200, `Admin reject failed: ${rejectRes.text}`);
+    assert.equal(rejectRes.body.reservation.recyclingStatus, 'verification_rejected');
+    assert.equal(rejectRes.body.passport.lifecycleStatus, 'DELIVERED');
+    assert.equal(rejectRes.body.passport.verifiedCo2eTons, 0);
+
+    // Factory resubmits corrected evidence
+    const resubmitRes = await req(`/api/reservations/${activeResId}/recycle`, {
+      method: 'POST',
+      token: factoryApproved.token,
+      body: {
+        recoveredTons: 1.82,
+        residualTons: 0.12,
+        lossTons: 0.04,
+        recyclingEvidenceFileId: recUpload.body.id,
+        recyclingEvidenceName: recUpload.body.originalName,
+        recyclingNotes: 'Resubmitted with stamped QC lab certificate and weighbridge ticket.',
+      },
+    });
+    assert.equal(resubmitRes.status, 200, `Recycle resubmit failed: ${resubmitRes.text}`);
+    assert.equal(resubmitRes.body.reservation.recyclingStatus, 'submitted_for_verification');
+
+    // Independent Admin/Verifier approves -> seals Stage 7 RECYCLED & verified net CO2e!
+    const approveRes = await req(`/api/admin/reservations/${activeResId}/verify-recycling`, {
+      method: 'POST',
+      token: admin.token,
+      body: {
+        decision: 'approved',
+        reason: 'Weighbridge 1,980 kg intake and rPET flake QC batch certificate independently audited.',
+      },
+    });
+    assert.equal(approveRes.status, 200, `Admin approve failed: ${approveRes.text}`);
+    assert.equal(approveRes.body.passport.lifecycleStatus, 'RECYCLED');
+    assert.equal(approveRes.body.passport.currentStage, 7);
+    assert.equal(approveRes.body.reservation.recyclingStatus, 'verified_recycled');
+    assert.equal(approveRes.body.reservation.esgConfidenceLevel, 'verified');
+    assert.ok(approveRes.body.impact.transportEmissionsTons >= 0);
+    assert.ok(
+      approveRes.body.impact.netVerifiedCo2eTons < approveRes.body.impact.grossRecyclingCo2eTons + 0.001,
+      'Net CO2e must account for road-adjusted freight transport deduction'
     );
 
     // Verify ESG Report strictly separates Stage 7 Verified Recycled items from Delivered-Pending items
@@ -558,6 +615,12 @@ async function main() {
     assert.ok(
       !esgRes.body.deliveredPendingItems.some((i: any) => i.reservationId === activeResId),
       'Verified recycled shipment must not appear in deliveredPendingItems'
+    );
+    assert.ok(
+      esgRes.body.methodologyDisclosure?.limitations?.geographicScope &&
+        esgRes.body.methodologyDisclosure?.limitations?.transportAssumption &&
+        esgRes.body.methodologyDisclosure?.limitations?.verifierRequirement,
+      'ESG report must include explicit scientific methodology limitations'
     );
     // Seeded OURO-PAS-2026-205B94 should be in deliveredPendingItems (Stage 6 DELIVERED, 0 verified CO2e)
     assert.ok(
@@ -650,6 +713,224 @@ async function main() {
     assert.equal(sysHealth.body.status, 'healthy');
     assert.equal(sysHealth.body.database.connected, true);
     assert.equal(sysHealth.body.storage.magicByteValidation, true);
+  });
+
+  // 11. Generator Self-Registration Governance (No Auto-Approval + Verification Gate)
+  let newGenToken = '';
+  let newGenHubId = 0;
+  let newGenUserId = 0;
+  await test('11. New Waste Generator starts pending, blocked from listing until Admin verifies', async () => {
+    const uniqueSuffix = `${Date.now()}-${Math.floor(Math.random() * 999)}`;
+    const regRes = await req('/api/auth/register-generator', {
+      method: 'POST',
+      body: {
+        facilityName: `QA Cairo Logistics Hub ${uniqueSuffix}`,
+        facilityType: 'commercial',
+        commercialRegNo: `CR-QA-${uniqueSuffix.slice(-6)}`,
+        governorate: 'Greater Cairo',
+        address: 'Plot 14, Industrial Service Zone, Cairo',
+        contactPerson: 'Hossam Nabil',
+        phone: '+201001234567',
+        email: `qa-gen-${uniqueSuffix}@example.eg`,
+        password: 'QaStrongPassword#2026',
+        maxCapacityTons: 25,
+      },
+    });
+    assert.equal(regRes.status, 201, `Generator registration failed: ${regRes.text}`);
+    newGenToken = regRes.body.token;
+    newGenHubId = regRes.body.user.hubId;
+    newGenUserId = regRes.body.user.id;
+    assert.ok(newGenHubId > 0, 'Expected hubId on newly registered generator user');
+
+    const adminQueue = await req('/api/admin/overview', { token: admin.token });
+    assert.equal(adminQueue.status, 200);
+    assert.ok(adminQueue.body.kpis.pendingGenerators >= 1, 'Expected kpis.pendingGenerators >= 1');
+    const createdHub = (adminQueue.body.hubs || []).find((h: any) => h.id === newGenHubId);
+    assert.ok(createdHub, 'Expected newly registered generator in Admin hubs directory');
+    assert.equal(createdHub.verificationStatus, 'pending', 'New generator MUST start pending');
+
+    // Pending generator MUST be blocked (403) from minting passports
+    const blockedMint = await req('/api/passports', {
+      method: 'POST',
+      token: newGenToken,
+      body: {
+        materialCategory: 'paper_cardboard',
+        materialSubtype: 'Blocked Pending Lot',
+        purityGrade: 'Grade A',
+        weightKg: 1500,
+        pricePerTonEgp: 9000,
+      },
+    });
+    assert.equal(blockedMint.status, 403, `Pending generator should be blocked 403, got ${blockedMint.status}`);
+
+    // Admin verifies generator with mandatory audit note
+    const verifyRes = await req(`/api/admin/hubs/${newGenHubId}/verify`, {
+      method: 'PATCH',
+      token: admin.token,
+      body: {
+        status: 'verified',
+        reason: 'Commercial registration and waste storage compliance audited.',
+      },
+    });
+    assert.equal(verifyRes.status, 200, `Admin hub verify failed: ${verifyRes.text}`);
+    assert.equal(verifyRes.body.hub.verificationStatus, 'verified');
+
+    // Now verified generator can mint & cancel a test lot
+    const allowedMint = await req('/api/passports', {
+      method: 'POST',
+      token: newGenToken,
+      body: {
+        materialCategory: 'paper_cardboard',
+        materialSubtype: 'QA Post-Verification OCC Lot',
+        purityGrade: 'Grade A',
+        weightKg: 1500,
+        pricePerTonEgp: 9200,
+      },
+    });
+    assert.equal(allowedMint.status, 201, `Verified generator mint failed: ${allowedMint.text}`);
+
+    // Clean up newly minted QA lot
+    await req(`/api/passports/${allowedMint.body.passport.id}`, {
+      method: 'DELETE',
+      token: newGenToken,
+    });
+  });
+
+  // 12. Object-Level Authorization on GET /api/passports/:codeOrId
+  await test('12. Object-level passport access control blocks unrelated generators and pending factories', async () => {
+    // Unrelated generator (newGenToken) MUST get 403 on Smart Village's racePassportCode
+    const unrelatedGenRes = await req(`/api/passports/${racePassportCode}`, { token: newGenToken });
+    assert.equal(
+      unrelatedGenRes.status,
+      403,
+      `Unrelated generator must get 403 on another hub's passport, got ${unrelatedGenRes.status}`
+    );
+
+    // Non-participating factory inspecting an active lot with remaining stock (1.0t) gets strictly redacted preview (0 private reservations, Stages 1-3 only)
+    const previewRes = await req(`/api/passports/${racePassportCode}`, { token: factoryPending.token });
+    assert.equal(previewRes.status, 200);
+    assert.equal(
+      (previewRes.body.reservations || []).length,
+      0,
+      'Prospective buyer preview must hide other buyers private reservations'
+    );
+    assert.ok(
+      (previewRes.body.events || []).every((e: any) => e.stage <= 3),
+      'Prospective buyer preview must only expose Stages 1-3 listing metadata'
+    );
+
+    // Non-participating factory MUST get 403 on a closed / fully-allocated passport
+    const ov = await req('/api/admin/overview', { token: admin.token });
+    const closedPassport = (ov.body.passports || []).find(
+      (p: any) => Number(p.availableTons) < 0.5 && p.lifecycleStatus === 'RECYCLED'
+    );
+    assert.ok(closedPassport, 'Expected at least one closed Stage 7 passport in DB');
+    const closedPassportRes = await req(`/api/passports/${closedPassport.passportCode}`, {
+      token: factoryPending.token,
+    });
+    assert.equal(
+      closedPassportRes.status,
+      403,
+      `Non-participating factory must get 403 on closed Stage 7 passport (${closedPassport.passportCode}), got ${closedPassportRes.status}`
+    );
+
+    // Owning generator, participating buyer factory, and admin MUST get 200 with full chain
+    assert.equal((await req(`/api/passports/${racePassportCode}`, { token: generator.token })).status, 200);
+    assert.equal((await req(`/api/passports/${racePassportCode}`, { token: factoryApproved.token })).status, 200);
+    assert.equal((await req(`/api/passports/${racePassportCode}`, { token: admin.token })).status, 200);
+  });
+
+  // 13. Strict User-Level Notification Isolation
+  await test('13. User-level notification isolation prevents same-role cross-organization leakage', async () => {
+    // User A (Smart Village generator) has user-specific notifications (e.g. dispute resolved, recycling verified)
+    const userANotifs = await req('/api/notifications', { token: generator.token });
+    assert.equal(userANotifs.status, 200);
+    const privateNotifA = (userANotifs.body.notifications || []).find(
+      (n: any) => n.userId === generator.user.id
+    );
+    assert.ok(privateNotifA, 'Expected at least one user-scoped notification for generator User A');
+
+    // User B (newly registered generator with same role 'generator_ops') MUST NOT see User A's notification
+    const userBNotifs = await req('/api/notifications', { token: newGenToken });
+    assert.equal(userBNotifs.status, 200);
+    const leaked = (userBNotifs.body.notifications || []).some((n: any) => n.id === privateNotifA.id);
+    assert.equal(leaked, false, 'User B MUST NOT receive User A user-scoped notification');
+
+    // User B attempting to mark User A's notification read MUST receive 403
+    const crossRead = await req(`/api/notifications/${privateNotifA.id}/read`, {
+      method: 'PATCH',
+      token: newGenToken,
+    });
+    assert.equal(
+      crossRead.status,
+      403,
+      `Cross-user notification read attempt must return 403, got ${crossRead.status}`
+    );
+
+    // Clean up temporary QA generator user so database remains tidy
+    await req(`/api/admin/users/${newGenUserId}`, {
+      method: 'PATCH',
+      token: admin.token,
+      body: { isActive: false, reason: 'QA post-test deactivation of temporary generator account' },
+    });
+  });
+
+  // 14. ESG Engine Math Unit Checks + Live Readiness Probe + Correlation Header
+  await test('14. ESG engine unit checks (1.25x circuity & confidence tiers), /api/ready & X-Request-Id', async () => {
+    const plasticFactor = DEFAULT_EMISSION_FACTORS.find((f) => f.materialCategory === 'plastics')!;
+    assert.ok(plasticFactor);
+
+    // Verified: requires verifierApproved=true AND BOTH weighbridge ticket AND recycling evidence
+    const verifiedImpact = calculateVerifiedRecyclingImpact({
+      recoveredTons: 10,
+      deliveredTons: 11,
+      residualTons: 0.7,
+      lossTons: 0.3,
+      transportDistanceKm: 100,
+      factor: plasticFactor,
+      hasWeighbridgeTicket: true,
+      hasRecyclingEvidence: true,
+      verifierApproved: true,
+    });
+    assert.equal(verifiedImpact.effectiveRoadKm, 125); // 100 * 1.25 road circuity
+    assert.equal(verifiedImpact.grossRecyclingCo2eTons, 15.2); // 10 * 1.52
+    assert.equal(verifiedImpact.transportEmissionsTons, 0.144); // (11 * 125 * 0.105) / 1000 = 0.144375 -> 0.144
+    assert.equal(verifiedImpact.netVerifiedCo2eTons, 15.056);
+    assert.equal(verifiedImpact.confidenceLevel, 'verified');
+
+    // Missing weighbridge ticket downgrades to 'calculated' even if verifier approved
+    const calculatedImpact = calculateVerifiedRecyclingImpact({
+      recoveredTons: 10,
+      deliveredTons: 11,
+      residualTons: 0.7,
+      lossTons: 0.3,
+      transportDistanceKm: 100,
+      factor: plasticFactor,
+      hasWeighbridgeTicket: false,
+      hasRecyclingEvidence: true,
+      verifierApproved: true,
+    });
+    assert.equal(calculatedImpact.confidenceLevel, 'calculated');
+
+    // Pre-approval projection is strictly 'estimated'
+    const estimatedImpact = calculateVerifiedRecyclingImpact({
+      recoveredTons: 10,
+      deliveredTons: 11,
+      residualTons: 0.7,
+      lossTons: 0.3,
+      transportDistanceKm: 100,
+      factor: plasticFactor,
+      hasWeighbridgeTicket: true,
+      hasRecyclingEvidence: true,
+      verifierApproved: false,
+    });
+    assert.equal(estimatedImpact.confidenceLevel, 'estimated');
+
+    // Live DB readiness probe + X-Request-Id header
+    const readyRes = await req('/api/ready');
+    assert.equal(readyRes.status, 200, `Readiness probe failed: ${readyRes.text}`);
+    assert.equal(readyRes.body?.ready, true);
+    assert.ok(readyRes.headers.get('x-request-id'), 'Expected X-Request-Id correlation header');
   });
 
   // Clean up second QA reservation so test run leaves minimal open queue clutter

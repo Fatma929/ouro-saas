@@ -31,7 +31,43 @@ export async function ensureSeeded(): Promise<void> {
   return seedPromise;
 }
 
+async function seedReferenceEmissionFactors(): Promise<void> {
+  const efCount = await db.select({ total: count() }).from(emissionFactors);
+  if ((efCount[0]?.total ?? 0) === 0) {
+    await db
+      .insert(emissionFactors)
+      .values(
+        DEFAULT_EMISSION_FACTORS.map((ef) => ({
+          materialCategory: ef.materialCategory,
+          labelEn: ef.labelEn,
+          labelAr: ef.labelAr,
+          co2eFactorPerTon: ef.co2eFactorPerTon,
+          transportFactorKgPerTonKm: ef.transportFactorKgPerTonKm,
+          methodologyName: ef.methodologyName,
+          sourceRef: ef.sourceRef,
+          version: ef.version,
+          boundaryNotes: ef.boundaryNotes,
+          baselineScenario: ef.baselineScenario,
+          dataQualityTier: ef.dataQualityTier,
+          updatedByEmail: 'system@ouro.eco',
+        }))
+      )
+      .onConflictDoNothing();
+  }
+}
+
 async function runSeedAndBackfill(): Promise<void> {
+  // Always ensure non-sensitive scientific emission factors exist in every environment
+  await seedReferenceEmissionFactors();
+
+  // Production guard: NEVER seed demo accounts or sample waste records in production unless explicitly enabled
+  const isProd = process.env.NODE_ENV === 'production';
+  const allowPilotSeed = process.env.ALLOW_PILOT_SEED === 'true';
+  if (isProd && !allowPilotSeed) {
+    console.log('[OURO] Production mode detected: skipping pilot demo accounts and sample dataset seeding.');
+    return;
+  }
+
   const existing = await db.select({ total: count() }).from(wasteSourceHubs);
   if ((existing[0]?.total ?? 0) === 0) {
     await runSeedIfEmpty();
@@ -763,28 +799,7 @@ async function runSeedIfEmpty(): Promise<void> {
  */
 async function ensurePilotEnhancementsBackfilled(): Promise<void> {
   // 1. Seed default emission factors if empty
-  const efCount = await db.select({ total: count() }).from(emissionFactors);
-  if ((efCount[0]?.total ?? 0) === 0) {
-    await db
-      .insert(emissionFactors)
-      .values(
-        DEFAULT_EMISSION_FACTORS.map((ef) => ({
-          materialCategory: ef.materialCategory,
-          labelEn: ef.labelEn,
-          labelAr: ef.labelAr,
-          co2eFactorPerTon: ef.co2eFactorPerTon,
-          transportFactorKgPerTonKm: ef.transportFactorKgPerTonKm,
-          methodologyName: ef.methodologyName,
-          sourceRef: ef.sourceRef,
-          version: ef.version,
-          boundaryNotes: ef.boundaryNotes,
-          baselineScenario: ef.baselineScenario,
-          dataQualityTier: ef.dataQualityTier,
-          updatedByEmail: 'system@ouro.eco',
-        }))
-      )
-      .onConflictDoNothing();
-  }
+  await seedReferenceEmissionFactors();
 
   // 2. Seed external 3PL vehicles if empty
   const vehCount = await db.select({ total: count() }).from(logisticsVehicles);

@@ -291,13 +291,19 @@ export const FactoryMarketplace: React.FC<FactoryMarketplaceProps> = ({
           recyclingNotes,
         }),
       });
-      setToast(
-        `Stage 7 Verified Recycling Sealed for ${recycleTarget.passportCode}: ${res.impact.recoveredTons} t recovered · Net ${res.impact.netVerifiedCo2eTons} tCO2e avoided (after −${res.impact.transportEmissionsTons} t freight).`
-      );
+      if (res.verificationPending) {
+        setToast(
+          `Recycling evidence submitted for ${recycleTarget.passportCode} (${res.impact.recoveredTons} t recovered). Awaiting independent OURO verifier approval to seal Stage 7 ESG.`
+        );
+      } else {
+        setToast(
+          `Stage 7 Verified Recycling Sealed for ${recycleTarget.passportCode}: ${res.impact.recoveredTons} t recovered · Net ${res.impact.netVerifiedCo2eTons} tCO2e avoided (after −${res.impact.transportEmissionsTons} t freight).`
+        );
+      }
       setRecycleTarget(null);
       await loadData();
     } catch (err: any) {
-      setError(err.message || 'Recycling verification failed.');
+      setError(err.message || 'Recycling verification submission failed.');
     } finally {
       setActionBusy(false);
     }
@@ -806,9 +812,10 @@ export const FactoryMarketplace: React.FC<FactoryMarketplaceProps> = ({
         /* Factory Reservations: Receipt Confirmation & Stage 7 Verified Recycling Outcomes */
         <div className="space-y-4">
           <div className="rounded-xl border border-amber-200 bg-amber-50/50 px-4 py-3 text-xs text-amber-900">
-            <strong>Strict ESG Chain-of-Custody Rule:</strong> Delivered shipments remain{' '}
-            <strong>DELIVERED</strong> (0 verified CO2e) until your facility records verified{' '}
-            <strong>Recovered Output, Residual, and Loss</strong> below to seal Stage 7 (<strong>RECYCLED</strong>).
+            <strong>Strict 2-Step ESG Chain-of-Custody Rule:</strong> Delivered shipments remain{' '}
+            <strong>DELIVERED</strong> (0 verified CO2e) until your facility submits verified{' '}
+            <strong>Recovered Output, Residual, Loss &amp; Proof</strong> AND an independent{' '}
+            <strong>OURO Platform Verifier approves Stage 7</strong>.
           </div>
 
           <div className="rounded-2xl bg-white border border-slate-200 overflow-x-auto">
@@ -838,6 +845,8 @@ export const FactoryMarketplace: React.FC<FactoryMarketplaceProps> = ({
                       r.pickupStatus !== 'cancelled';
                     const isDelivered = r.pickupStatus === 'delivered';
                     const isVerifiedRecycled = r.recyclingStatus === 'verified_recycled';
+                    const isSubmittedForReview = r.recyclingStatus === 'submitted_for_verification';
+                    const isRejectedSubmission = r.recyclingStatus === 'verification_rejected';
 
                     return (
                       <tr key={r.id} className="hover:bg-slate-50/70 align-top">
@@ -892,6 +901,14 @@ export const FactoryMarketplace: React.FC<FactoryMarketplaceProps> = ({
                             <div className="text-[11px] font-mono font-bold text-emerald-700">
                               Recycled: {r.recoveredTons} t · Net {r.co2eAvoidedTons} tCO2e ({r.esgConfidenceLevel})
                             </div>
+                          ) : isSubmittedForReview ? (
+                            <div className="text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-0.5 inline-block">
+                              Submitted ({r.recoveredTons} t) — Pending Verifier Approval
+                            </div>
+                          ) : isRejectedSubmission ? (
+                            <div className="text-[11px] font-semibold text-red-700 bg-red-50 border border-red-200 rounded px-2 py-0.5 inline-block">
+                              Verification Rejected — Resubmit Proof
+                            </div>
                           ) : (
                             <div className="text-[11px] font-mono text-slate-500">
                               Est. potential: ~{Number(r.estimatedCo2eTons || 0).toFixed(2)} tCO2e (unverified)
@@ -910,14 +927,18 @@ export const FactoryMarketplace: React.FC<FactoryMarketplaceProps> = ({
                                 <span>Confirm Receipt</span>
                               </button>
                             )}
-                            {isDelivered && !isVerifiedRecycled && (
+                            {isDelivered && !isVerifiedRecycled && !isSubmittedForReview && (
                               <button
                                 type="button"
                                 onClick={() => openRecycleModal(r)}
                                 className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-2.5 py-1.5 text-[11px] font-semibold text-white whitespace-nowrap"
                               >
                                 <Recycle className="w-3 h-3" />
-                                <span>Verify Recycling (Stage 7)</span>
+                                <span>
+                                  {isRejectedSubmission
+                                    ? 'Resubmit Recycling Evidence'
+                                    : 'Submit Recycling Evidence'}
+                                </span>
                               </button>
                             )}
                             {canCancel && (

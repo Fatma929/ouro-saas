@@ -184,13 +184,13 @@ export default function App() {
               {/* Zone 3: Quick Passport Lookup + Notifications + Language + Sign Out */}
               <div className="flex items-center gap-2 shrink-0">
                 <form onSubmit={handlePassportLookup} className="hidden lg:flex items-center relative">
-                  <Search className="w-3.5 h-3.5 text-[#9EA3A4] absolute left-2.5 pointer-events-none" />
+                  <Search className="w-3.5 h-3.5 text-[#9EA3A4] absolute start-2.5 pointer-events-none" />
                   <input
                     type="text"
                     value={passportSearch}
                     onChange={(e) => setPassportSearch(e.target.value)}
                     placeholder="OURO-PAS-..."
-                    className="w-36 rounded-lg bg-white/8 border border-white/15 pl-8 pr-2.5 py-1.5 text-xs font-mono text-white placeholder-[#9EA3A4] focus:outline-none focus:border-[#A88B64]"
+                    className="w-36 rounded-lg bg-white/8 border border-white/15 ps-8 pe-2.5 py-1.5 text-xs font-mono text-white placeholder-[#9EA3A4] focus:outline-none focus:border-[#A88B64]"
                   />
                 </form>
 
@@ -228,6 +228,28 @@ export default function App() {
                 </button>
               </div>
             </div>
+
+            {/* Mobile Admin Workspace Switcher (visible below md breakpoint) */}
+            {user.role === 'platform_admin' && (
+              <div className="md:hidden border-t border-white/10 px-4 py-2 flex items-center gap-2 overflow-x-auto">
+                {(
+                  ['platform_admin', 'generator_ops', 'factory_procurement', 'driver_3pl'] as UserRole[]
+                ).map((ws) => (
+                  <button
+                    key={ws}
+                    type="button"
+                    onClick={() => setActiveWorkspace(ws)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
+                      activeWorkspace === ws
+                        ? 'bg-[#3D7568] text-white'
+                        : 'bg-white/5 text-[#BCC2C3] hover:text-white'
+                    }`}
+                  >
+                    {t.roles[ws]}
+                  </button>
+                ))}
+              </div>
+            )}
           </header>
 
           {/* Role-Protected Main Workspace Viewport */}

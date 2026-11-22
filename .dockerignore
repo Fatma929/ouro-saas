@@ -1,0 +1,11 @@
+node_modules
+dist
+storage/private
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+walkthrough.md

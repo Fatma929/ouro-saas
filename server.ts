@@ -50,6 +50,7 @@ import {
   getEmissionFactorForCategory,
   getEmissionFactorMap,
   calculateVerifiedRecyclingImpact,
+  ESG_METHODOLOGY_LIMITATIONS,
 } from './src/lib/esg-engine.ts';
 import {
   dispatchNotification,
@@ -165,16 +166,37 @@ async function canUserAccessFileWithLinks(
     if (user.logisticsProviderId && r.logisticsProviderId === user.logisticsProviderId) return true;
   }
 
-  // Check if supporting doc is linked to a passport visible to generator or reserving factory
+  // Check if supporting doc is linked to a passport visible to owning generator OR an APPROVED factory (on active lot or own reservation)
   const linkedPassport = await db
-    .select({ id: wastePassports.id, hubId: wastePassports.hubId })
+    .select({
+      id: wastePassports.id,
+      hubId: wastePassports.hubId,
+      availableTons: wastePassports.availableTons,
+      status: wastePassports.status,
+    })
     .from(wastePassports)
     .where(eq(wastePassports.supportingDocFileId, file.id))
     .limit(1);
 
   if (linkedPassport.length > 0) {
-    if (user.hubId && linkedPassport[0].hubId === user.hubId) return true;
-    if (user.factoryId) return true; // Approved buyers inspecting lot spec sheet
+    const lp = linkedPassport[0];
+    if (user.hubId && lp.hubId === user.hubId) return true;
+    if (user.factoryId) {
+      const [fac] = await db
+        .select({ kycStatus: recyclingFactories.kycStatus })
+        .from(recyclingFactories)
+        .where(eq(recyclingFactories.id, user.factoryId))
+        .limit(1);
+      if (fac?.kycStatus === 'approved') {
+        if (lp.availableTons > 0 && lp.status !== 'cancelled') return true;
+        const ownRes = await db
+          .select({ id: reservations.id })
+          .from(reservations)
+          .where(and(eq(reservations.passportId, lp.id), eq(reservations.factoryId, user.factoryId)))
+          .limit(1);
+        if (ownRes.length > 0) return true;
+      }
+    }
   }
 
   return false;
@@ -489,6 +511,7 @@ app.post('/api/auth/register-generator', authLimiter, async (req, res) => {
           availableTons: 0,
           reservedTons: 0,
           purityScore: 95.0,
+          verificationStatus: 'pending', // New self-registered organizations NEVER receive automatic approval
         })
         .returning();
 
@@ -506,6 +529,20 @@ app.post('/api/auth/register-generator', authLimiter, async (req, res) => {
           language: 'en',
         })
         .returning();
+
+      await dispatchNotification(
+        {
+          targetRole: 'platform_admin',
+          type: 'kyc',
+          titleEn: 'New Waste Generator Verification Pending',
+          titleAr: 'طلب اعتماد منشأة مولدة جديدة قيد المراجعة',
+          messageEn: `${createdFacility.nameEn} (${createdFacility.code}, CR: ${createdFacility.commercialRegNo}) requires compliance approval before publishing lots.`,
+          messageAr: `المنشأة ${createdFacility.nameAr} (${createdFacility.code}) بانتظار المراجعة قبل إدراج دفعات المخلفات.`,
+          entityType: 'waste_generator',
+          entityId: String(createdFacility.id),
+        },
+        tx
+      );
 
       return { createdUser, createdFacility };
     });
@@ -883,6 +920,11 @@ app.post(
         }
         const hub = hubRows[0];
 
+        // Enforce facility verification gate for self-registered waste generators
+        if (req.authUser!.role !== 'platform_admin' && hub.verificationStatus !== 'verified') {
+          throw new Error('GENERATOR_VERIFICATION_PENDING');
+        }
+
         const newAvailableTons = Number((hub.availableTons + weightTons).toFixed(3));
         const passportCode = generatePassportCode();
         const resolvedPhotoUrl =
@@ -978,6 +1020,13 @@ app.post(
     } catch (error: any) {
       if (error?.message === 'HUB_NOT_FOUND') {
         return res.status(404).json({ error: 'Waste generator facility not found.' });
+      }
+      if (error?.message === 'GENERATOR_VERIFICATION_PENDING') {
+        return res.status(403).json({
+          error:
+            'Verification Pending: Your Waste Generator facility must be verified by OURO Compliance before publishing marketplace listings.',
+          code: 'GENERATOR_VERIFICATION_PENDING',
+        });
       }
       console.error('Passport minting error:', error);
       return res.status(500).json({ error: 'Failed to mint Digital Waste Passport.' });
@@ -1251,28 +1300,71 @@ app.get('/api/passports/:codeOrId', requireAuth, async (req: AuthRequest, res) =
     const chainIntegrity = verifyPassportHashChain(eventsById);
     const user = req.authUser!;
 
-    // Scope financial details on linked reservations to authorized supply-chain parties
-    const scopedReservations = linkedReservations.map((r) => {
-      const canViewCommercial =
-        user.role === 'platform_admin' ||
-        user.hubId === r.reservation.hubId ||
-        user.factoryId === r.reservation.factoryId ||
-        user.logisticsProviderId === r.reservation.logisticsProviderId;
+    // Strict object-level authorization for Digital Waste Passports
+    const isAdmin = user.role === 'platform_admin';
+    const isOwningGenerator = Boolean(user.hubId && user.hubId === passport.hubId);
+    const isParticipatingFactory = Boolean(
+      user.factoryId && linkedReservations.some((r) => r.reservation.factoryId === user.factoryId)
+    );
+    const isAssigned3pl = Boolean(
+      user.logisticsProviderId &&
+        linkedReservations.some((r) => r.reservation.logisticsProviderId === user.logisticsProviderId)
+    );
 
-      return {
-        ...r.reservation,
-        totalEgp: canViewCommercial ? r.reservation.totalEgp : null,
-        factoryNameEn: r.factory.nameEn,
-        factoryNameAr: r.factory.nameAr,
-        logisticsProviderNameEn: r.provider.nameEn,
-        logisticsProviderLicense: r.provider.envTransportLicenseId,
-      };
+    let isPublicMarketplacePreview = false;
+    if (
+      !isAdmin &&
+      !isOwningGenerator &&
+      !isParticipatingFactory &&
+      !isAssigned3pl &&
+      user.role === 'factory_procurement' &&
+      passport.availableTons >= 0.5 &&
+      passport.status !== 'cancelled'
+    ) {
+      // Allow prospective buyer factories to inspect active listed lots (Stages 1-3 specs only, hiding other buyers' private reservations)
+      isPublicMarketplacePreview = true;
+    }
+
+    if (
+      !isAdmin &&
+      !isOwningGenerator &&
+      !isParticipatingFactory &&
+      !isAssigned3pl &&
+      !isPublicMarketplacePreview
+    ) {
+      return res.status(403).json({
+        error: 'Forbidden: You do not have permission to inspect this Digital Waste Passport.',
+      });
+    }
+
+    // Filter linked reservations strictly to parties authorized to see each commercial record
+    const visibleReservations = linkedReservations.filter((r) => {
+      if (isAdmin || isOwningGenerator) return true;
+      if (user.factoryId && r.reservation.factoryId === user.factoryId) return true;
+      if (user.logisticsProviderId && r.reservation.logisticsProviderId === user.logisticsProviderId) return true;
+      return false;
     });
+
+    const scopedReservations = visibleReservations.map((r) => ({
+      ...r.reservation,
+      totalEgp:
+        isAdmin || isOwningGenerator || (user.factoryId && r.reservation.factoryId === user.factoryId)
+          ? r.reservation.totalEgp
+          : null,
+      factoryNameEn: r.factory.nameEn,
+      factoryNameAr: r.factory.nameAr,
+      logisticsProviderNameEn: r.provider.nameEn,
+      logisticsProviderLicense: r.provider.envTransportLicenseId,
+    }));
+
+    const scopedEvents = isPublicMarketplacePreview
+      ? eventsById.filter((ev) => ev.stage <= 3)
+      : eventsById;
 
     return res.json({
       passport,
       hub: hubRows[0] || null,
-      events: eventsById,
+      events: scopedEvents,
       chainIntegrity,
       reconciliation: {
         initialTons: Number((passport.initialWeightKg / 1000).toFixed(3)),
@@ -2074,6 +2166,8 @@ app.post(
             ? current.transportDistanceKm
             : Number(haversineKm(hub.lat, hub.lng, factory.lat, factory.lng).toFixed(1));
 
+        const isVerifierDirect = req.authUser!.role === 'platform_admin';
+
         const impact = calculateVerifiedRecyclingImpact({
           recoveredTons: recTons,
           deliveredTons: deliveredTonsBasis,
@@ -2081,9 +2175,76 @@ app.post(
           lossTons: lTons,
           transportDistanceKm: distanceKm,
           factor,
-          hasWeighbridgeTicket: Boolean(current.weighbridgeFileId || current.receivedWeightKg),
+          hasWeighbridgeTicket: Boolean(current.weighbridgeFileId && current.receivedWeightKg),
           hasRecyclingEvidence: Boolean(recyclingEvidenceFileId),
+          verifierApproved: isVerifierDirect,
         });
+
+        // Two-step governance:
+        // - Factory users submit recycling mass balance & proof -> 'submitted_for_verification' (Passport stays DELIVERED, 0 verified CO2e)
+        // - Platform Admin / Authorized Verifier approves via POST /api/admin/reservations/:id/verify-recycling (or direct admin action) -> 'verified_recycled' (Stage 7 RECYCLED)
+        if (!isVerifierDirect) {
+          const [submittedRes] = await tx
+            .update(reservations)
+            .set({
+              receiptStatus: 'received',
+              receivedAt: current.receivedAt || new Date(),
+              receivedWeightKg: current.receivedWeightKg || Math.round(deliveredTonsBasis * 1000),
+              recyclingStatus: 'submitted_for_verification',
+              recoveredTons: impact.recoveredTons,
+              residualTons: impact.residualTons,
+              lossTons: impact.lossTons,
+              recyclingEvidenceFileId: recyclingEvidenceFileId ? Number(recyclingEvidenceFileId) : null,
+              recyclingEvidenceName: recyclingEvidenceName
+                ? String(recyclingEvidenceName).trim().slice(0, 140)
+                : null,
+              recyclingNotes: recyclingNotes ? String(recyclingNotes).trim().slice(0, 1000) : null,
+              transportDistanceKm: impact.transportDistanceKm,
+              transportEmissionsTons: impact.transportEmissionsTons,
+              estimatedCo2eTons: impact.netVerifiedCo2eTons,
+              co2eAvoidedTons: 0, // Remains 0 until independent verifier approval!
+              esgConfidenceLevel: 'estimated',
+              updatedAt: new Date(),
+            })
+            .where(eq(reservations.id, current.id))
+            .returning();
+
+          await appendHashedPassportEvents(tx, passport.id, [
+            {
+              stage: 6,
+              eventType: 'RECYCLING_EVIDENCE_SUBMITTED',
+              actorName: `${req.authUser!.fullName} (${factory.nameEn})`,
+              actorRole: req.authUser!.role,
+              summaryEn: `${factory.nameEn} submitted Stage 7 recycling evidence (${impact.recoveredTons.toFixed(2)} t recovered, ${impact.residualTons.toFixed(2)} t residual, ${impact.lossTons.toFixed(2)} t loss). Awaiting independent OURO verifier approval before sealing verified CO2e.`,
+              summaryAr: `قدم مصنع ${factory.nameAr} مستندات إعادة التدوير (${impact.recoveredTons.toFixed(2)} طن مستردة) بانتظار اعتماد المراجع المستقل قبل إغلاق المرحلة 7.`,
+              metadataJson: JSON.stringify({ ...impact, status: 'submitted_for_verification' }),
+              evidenceFileId: recyclingEvidenceFileId ? Number(recyclingEvidenceFileId) : null,
+              lat: factory.lat,
+              lng: factory.lng,
+            },
+          ]);
+
+          await dispatchNotification(
+            {
+              targetRole: 'platform_admin',
+              type: 'recycling',
+              titleEn: `Recycling Evidence Pending Approval (${passport.passportCode})`,
+              titleAr: `إثبات إعادة تدوير بانتظار الاعتماد (${passport.passportCode})`,
+              messageEn: `${factory.nameEn} submitted ${impact.recoveredTons.toFixed(2)} t recovered output for ${current.reservationCode}. Review & approve to seal Stage 7 ESG.`,
+              messageAr: `قدم مصنع ${factory.nameAr} إثبات استرداد ${impact.recoveredTons.toFixed(2)} طن بانتظار المراجعة والاعتماد.`,
+              entityType: 'passport',
+              entityId: passport.passportCode,
+            },
+            tx
+          );
+
+          return {
+            reservation: submittedRes,
+            passport,
+            impact,
+            verificationPending: true,
+          };
+        }
 
         const [savedRes] = await tx
           .update(reservations)
@@ -2135,9 +2296,9 @@ app.post(
           {
             stage: 7,
             eventType: 'RECYCLING_VERIFIED_ESG',
-            actorName: `${req.authUser!.fullName} (${factory.nameEn})`,
+            actorName: `${req.authUser!.fullName} (OURO Verifier)`,
             actorRole: req.authUser!.role,
-            summaryEn: `Verified recycling outcome sealed at ${factory.nameEn}: ${impact.recoveredTons.toFixed(2)} t recovered (${impact.recoveryYieldPct}% yield), ${impact.residualTons.toFixed(2)} t residual, ${impact.lossTons.toFixed(2)} t loss. Net GHG avoided: ${impact.netVerifiedCo2eTons.toFixed(2)} tCO2e (Gross ${impact.grossRecyclingCo2eTons.toFixed(2)} - 3PL Freight ${impact.transportEmissionsTons.toFixed(3)} tCO2e; Confidence: ${impact.confidenceLevel.toUpperCase()}).`,
+            summaryEn: `Verified recycling outcome sealed at ${factory.nameEn}: ${impact.recoveredTons.toFixed(2)} t recovered (${impact.recoveryYieldPct}% yield), ${impact.residualTons.toFixed(2)} t residual, ${impact.lossTons.toFixed(2)} t loss. Net GHG avoided: ${impact.netVerifiedCo2eTons.toFixed(2)} tCO2e (Gross ${impact.grossRecyclingCo2eTons.toFixed(2)} - Road-Adjusted Freight ${impact.transportEmissionsTons.toFixed(3)} tCO2e; Confidence: ${impact.confidenceLevel.toUpperCase()}).`,
             summaryAr: `تم التحقق النهائي من إعادة التدوير في ${factory.nameAr}: ${impact.recoveredTons.toFixed(2)} طن مواد مستردة (${impact.recoveryYieldPct}%). صافي الانبعاثات المتجنبة: ${impact.netVerifiedCo2eTons.toFixed(2)} طن CO2e بعد خصم انبعاثات النقل.`,
             metadataJson: JSON.stringify(impact),
             evidenceFileId: recyclingEvidenceFileId ? Number(recyclingEvidenceFileId) : null,
@@ -2160,21 +2321,7 @@ app.post(
           tx
         );
 
-        await dispatchNotification(
-          {
-            targetRole: 'platform_admin',
-            type: 'recycling',
-            titleEn: `Verified Recycling Outcome Sealed (${passport.passportCode})`,
-            titleAr: `اعتماد نتيجة إعادة تدوير (${passport.passportCode})`,
-            messageEn: `${impact.recoveredTons.toFixed(2)} t recovered / ${impact.netVerifiedCo2eTons.toFixed(2)} tCO2e net (${impact.confidenceLevel}).`,
-            messageAr: `تم استرداد ${impact.recoveredTons.toFixed(2)} طن بصافي ${impact.netVerifiedCo2eTons.toFixed(2)} طن CO2e.`,
-            entityType: 'passport',
-            entityId: passport.passportCode,
-          },
-          tx
-        );
-
-        return { reservation: savedRes, passport: savedPassport, impact };
+        return { reservation: savedRes, passport: savedPassport, impact, verificationPending: false };
       });
 
       return res.json(result);
@@ -2775,6 +2922,31 @@ app.get('/api/admin/overview', requireAuth, requireRole('platform_admin'), async
     const samplePassportsCount = nonCancelled.filter((p) => p.isSampleData).length;
     const livePassportsCount = nonCancelled.length - samplePassportsCount;
 
+    const hubMap = new Map(hubs.map((h) => [h.id, h]));
+    const factoryMap = new Map(factories.map((f) => [f.id, f]));
+    const passportMap = new Map(passports.map((p) => [p.id, p]));
+
+    const pendingRecyclingReviews = allReservations
+      .filter((r) => r.pickupStatus === 'delivered' && r.recyclingStatus === 'submitted_for_verification')
+      .map((r) => {
+        const p = passportMap.get(r.passportId);
+        const h = hubMap.get(r.hubId);
+        const f = factoryMap.get(r.factoryId);
+        return {
+          ...r,
+          passportCode: p?.passportCode || `#${r.passportId}`,
+          materialCategory: p?.materialCategory || '',
+          materialSubtype: p?.materialSubtype || '',
+          purityGrade: p?.purityGrade || '',
+          hubNameEn: h?.nameEn || '',
+          hubCode: h?.code || '',
+          factoryNameEn: f?.nameEn || '',
+          factoryTaxId: f?.taxId || '',
+        };
+      });
+
+    const pendingGenerators = hubs.filter((h) => h.verificationStatus === 'pending').length;
+
     return res.json({
       kpis: {
         listedTons,
@@ -2786,6 +2958,8 @@ app.get('/api/admin/overview', requireAuth, requireRole('platform_admin'), async
         generatorsByType,
         approvedFactories: factories.filter((f) => f.kycStatus === 'approved').length,
         pendingFactories: factories.filter((f) => f.kycStatus === 'pending').length,
+        pendingGenerators,
+        pendingRecyclingReviewsCount: pendingRecyclingReviews.length,
         certified3plPartners: providers.filter((p) => p.isVerified).length,
         verifiedCo2eTons,
         estimatedCo2eTons,
@@ -2812,6 +2986,7 @@ app.get('/api/admin/overview', requireAuth, requireRole('platform_admin'), async
       emissionFactors: allFactors,
       disputes: allDisputes,
       passports,
+      pendingRecyclingReviews,
       reservationsCount: allReservations.length,
       recentEvents: recentEvents.map((e) => ({
         ...e.event,
@@ -3244,13 +3419,14 @@ app.get(
         estimatedPendingCo2eTons,
         methodologyDisclosure: {
           accountingPrinciple:
-            'Only waste lots with Stage 7 Verified Recycling Outcomes are included in Verified Recycled Tonnage and Net CO2e Avoided totals. Listed and Delivered-only quantities are reported separately and NEVER counted as recycled.',
+            'Only waste lots with independent Platform Verifier approval of Stage 7 Recycling Outcomes are included in Verified Recycled Tonnage and Net CO2e Avoided totals. Listed, Delivered-only, and Unapproved Submissions are reported separately and NEVER counted as recycled.',
           formula:
-            'Net Verified CO2e Avoided = (Verified Recovered Output Tons × Material Emission Factor) − (Delivered Tons × Corridor Distance km × Heavy-Duty Freight Factor / 1000)',
+            'Net Verified CO2e Avoided = (Verified Recovered Output Tons × Material Emission Factor) − (Delivered Tons × Haversine Corridor km × 1.25 Road Circuity × Heavy-Duty Freight Factor / 1000)',
+          limitations: ESG_METHODOLOGY_LIMITATIONS,
           dataConfidenceTiers: {
-            verified: 'Backed by facility recycling evidence and weighbridge intake records.',
-            calculated: 'Facility-confirmed recovered mass without uploaded certificate attachment.',
-            estimated: 'Pre-recycling projection on Listed or Delivered-only shipments (excluded from verified totals).',
+            verified: 'Independently approved + backed by BOTH weighbridge intake ticket AND uploaded recycling evidence.',
+            calculated: 'Independently approved without complete dual documentary evidence pair.',
+            estimated: 'Pre-approval projection on Listed, Delivered, or Pending-Verification shipments (excluded from verified totals).',
           },
         },
         emissionFactors: Object.values(factorMap).map((f) => ({
@@ -3388,9 +3564,19 @@ app.get(
   }
 );
 
-// Public liveness probe (no internal status leaked)
+// Public liveness probe (fast, zero internal leakage)
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
+});
+
+// Readiness probe for Cloud Run / Kubernetes load balancers (verifies live PostgreSQL connectivity)
+app.get('/api/ready', async (_req, res) => {
+  try {
+    await db.execute(sql`SELECT 1`);
+    return res.json({ ready: true });
+  } catch {
+    return res.status(503).json({ ready: false });
+  }
 });
 
 // Centralized Express error handler (prevents leaking stack traces or Multer internals)
@@ -3410,8 +3596,16 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 // ============================================================================
 
 async function startServer() {
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   const isProd = process.env.NODE_ENV === 'production';
+
+  if (isProd && (!process.env.OURO_SESSION_SECRET || !process.env.OURO_FILE_SIGN_SECRET)) {
+    logStructured('warn', 'missing_production_signing_secrets', {
+      message:
+        'OURO_SESSION_SECRET and/or OURO_FILE_SIGN_SECRET are not explicitly configured in production environment.',
+    });
+  }
+
   const httpServer = http.createServer(app);
 
   if (!isProd) {

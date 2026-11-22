@@ -81,7 +81,7 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({ lang, onInsp
       </button>
 
       {open && (
-        <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-xl bg-white text-[#272F31] shadow-2xl border border-slate-200 z-50 overflow-hidden">
+        <div className="absolute end-0 mt-2 w-80 sm:w-96 rounded-xl bg-white text-[#272F31] shadow-2xl border border-slate-200 z-50 overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 bg-[#272F31] text-white">
             <span className="text-xs font-bold">
               {lang === 'ar' ? 'مركز الإشعارات' : 'Notifications'} ({unreadCount})
@@ -109,7 +109,7 @@ export const NotificationBell: React.FC<NotificationBellProps> = ({ lang, onInsp
                   key={n.id}
                   type="button"
                   onClick={() => handleMarkRead(n)}
-                  className={`w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors ${
+                  className={`w-full text-start px-4 py-3 hover:bg-slate-50 transition-colors ${
                     n.isRead ? 'opacity-70' : 'bg-emerald-50/30'
                   }`}
                 >

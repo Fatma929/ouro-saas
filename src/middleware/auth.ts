@@ -24,7 +24,11 @@ export interface AuthRequest extends Request {
   authUser?: AuthenticatedUser;
 }
 
-const OWNER_ADMIN_EMAIL = 'fatmaelzahraalegal@gmail.com';
+const OWNER_ADMIN_EMAIL = (
+  process.env.OURO_BOOTSTRAP_ADMIN_EMAIL || 'fatmaelzahraalegal@gmail.com'
+)
+  .trim()
+  .toLowerCase();
 
 async function syncFirebaseUser(uid: string, email: string, name?: string) {
   // Check by uid first, then by email

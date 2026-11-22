@@ -1,9 +1,14 @@
+import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 
 /**
- * Security headers safe for embedded iframe preview and production SaaS deployments.
+ * Security headers + X-Request-Id correlation safe for embedded iframe preview and production SaaS deployments.
  */
-export function securityHeadersMiddleware(_req: Request, res: Response, next: NextFunction) {
+export function securityHeadersMiddleware(req: Request, res: Response, next: NextFunction) {
+  const reqId =
+    (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'].slice(0, 64)) ||
+    crypto.randomUUID();
+  res.setHeader('X-Request-Id', reqId);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(self), geolocation=(self), microphone=()');
@@ -13,43 +18,61 @@ export function securityHeadersMiddleware(_req: Request, res: Response, next: Ne
 }
 
 /**
- * Lightweight in-memory sliding-window rate limiter per IP + route bucket.
+ * Pluggable sliding-window rate-limit store interface.
+ * Defaults to single-instance InMemoryRateLimitStore; swap with RedisRateLimitStore when scaling horizontally.
+ */
+export interface RateLimitStore {
+  recordAndCount(key: string, nowMs: number, windowMs: number): Promise<number> | number;
+}
+
+class InMemoryRateLimitStore implements RateLimitStore {
+  private hits = new Map<string, number[]>();
+
+  recordAndCount(key: string, nowMs: number, windowMs: number): number {
+    const cutoff = nowMs - windowMs;
+    const recent = (this.hits.get(key) || []).filter((ts) => ts > cutoff);
+    recent.push(nowMs);
+    this.hits.set(key, recent);
+
+    if (this.hits.size > 5000) {
+      for (const [k, arr] of this.hits.entries()) {
+        const filtered = arr.filter((ts) => ts > cutoff);
+        if (filtered.length === 0) this.hits.delete(k);
+        else this.hits.set(k, filtered);
+      }
+    }
+    return recent.length;
+  }
+}
+
+const defaultRateLimitStore = new InMemoryRateLimitStore();
+
+/**
+ * Sliding-window rate limiter per IP + route bucket.
+ * Note: For multi-replica Cloud Run deployments, inject a Redis-backed RateLimitStore via REDIS_URL.
  */
 export function createRateLimiter(options: {
   windowMs: number;
   maxRequests: number;
   bucketName: string;
+  store?: RateLimitStore;
 }) {
-  const hits = new Map<string, number[]>();
+  const store = options.store || defaultRateLimitStore;
 
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const ip =
       (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
       req.socket.remoteAddress ||
       'unknown';
     const key = `${options.bucketName}:${ip}`;
-    const now = Date.now();
-    const cutoff = now - options.windowMs;
-    const recent = (hits.get(key) || []).filter((ts) => ts > cutoff);
+    const count = await store.recordAndCount(key, Date.now(), options.windowMs);
 
-    if (recent.length >= options.maxRequests) {
+    if (count > options.maxRequests) {
       res.setHeader('Retry-After', String(Math.ceil(options.windowMs / 1000)));
       return res.status(429).json({
         error: 'Too many requests. Please wait a moment and try again.',
         code: 'RATE_LIMIT_EXCEEDED',
       });
-    }
-
-    recent.push(now);
-    hits.set(key, recent);
-
-    // Periodic pruning to prevent unbounded memory growth
-    if (hits.size > 5000) {
-      for (const [k, arr] of hits.entries()) {
-        const filtered = arr.filter((ts) => ts > cutoff);
-        if (filtered.length === 0) hits.delete(k);
-        else hits.set(k, filtered);
-      }
     }
 
     return next();

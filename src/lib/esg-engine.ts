@@ -127,6 +127,15 @@ export async function getEmissionFactorForCategory(category: string): Promise<Em
   };
 }
 
+export const ESG_METHODOLOGY_LIMITATIONS = {
+  geographicScope:
+    'Secondary emission factors are adapted from US EPA WARM v16, UK DEFRA 2024, and IPCC 2006 Vol. 5 proxies. Actual Egyptian/MENA industrial electricity grid intensity, regional sorting yields, and local landfill methane capture rates may differ; facility-specific LCA factors should be substituted once audited.',
+  transportAssumption:
+    'Freight distance uses geodesic Haversine corridor distance (km) between verified generator and recycling factory coordinates multiplied by a 1.25x road circuity adjustment factor when live route telemetry is unavailable.',
+  verifierRequirement:
+    'Only shipments with independent Platform Verifier / Admin approval of Stage 7 recycling evidence enter Verified Recycled Tonnage and Net Verified CO2e totals. Unverified submissions remain in Delivered/Pending status.',
+};
+
 export interface EsgImpactCalculation {
   recoveredTons: number;
   deliveredTons: number;
@@ -134,6 +143,7 @@ export interface EsgImpactCalculation {
   lossTons: number;
   recoveryYieldPct: number;
   transportDistanceKm: number;
+  effectiveRoadKm: number;
   grossRecyclingCo2eTons: number;
   transportEmissionsTons: number;
   netVerifiedCo2eTons: number;
@@ -145,8 +155,11 @@ export interface EsgImpactCalculation {
 /**
  * Scientifically defensible net GHG avoided calculation:
  * - Gross savings apply STRICTLY to verified recovered output (NEVER raw listed or raw delivered weight).
- * - Heavy-duty 3PL freight transport emissions (kg CO2e / ton-km) are deducted.
- * - Confidence tier is explicitly classified based on evidence completeness.
+ * - Heavy-duty 3PL freight transport emissions (kg CO2e / ton-km) are deducted using road-adjusted km.
+ * - Confidence tier is explicitly classified based on independent approval AND evidence completeness:
+ *   - 'verified': Independent verifier approved + BOTH weighbridge intake weight/ticket AND recycling evidence file.
+ *   - 'calculated': Independent verifier approved without the full dual documentary pair.
+ *   - 'estimated': Pre-approval projection (never included in verified totals).
  */
 export function calculateVerifiedRecyclingImpact(params: {
   recoveredTons: number;
@@ -157,6 +170,8 @@ export function calculateVerifiedRecyclingImpact(params: {
   factor: EmissionFactorRecord;
   hasWeighbridgeTicket: boolean;
   hasRecyclingEvidence: boolean;
+  verifierApproved?: boolean;
+  roadCircuityMultiplier?: number;
 }): EsgImpactCalculation {
   const {
     recoveredTons,
@@ -167,12 +182,16 @@ export function calculateVerifiedRecyclingImpact(params: {
     factor,
     hasWeighbridgeTicket,
     hasRecyclingEvidence,
+    verifierApproved = true,
+    roadCircuityMultiplier = 1.25,
   } = params;
 
   const grossRecyclingCo2eTons = Number((recoveredTons * factor.co2eFactorPerTon).toFixed(3));
+  const safeStraightKm = Math.max(0, transportDistanceKm);
+  const effectiveRoadKm = Number((safeStraightKm * roadCircuityMultiplier).toFixed(1));
   // Freight emissions occur on the full delivered tonnage hauled from generator to recycling facility
   const transportEmissionsTons = Number(
-    ((deliveredTons * Math.max(0, transportDistanceKm) * factor.transportFactorKgPerTonKm) / 1000).toFixed(3)
+    ((deliveredTons * effectiveRoadKm * factor.transportFactorKgPerTonKm) / 1000).toFixed(3)
   );
   const netVerifiedCo2eTons = Number(
     Math.max(0, grossRecyclingCo2eTons - transportEmissionsTons).toFixed(3)
@@ -180,13 +199,10 @@ export function calculateVerifiedRecyclingImpact(params: {
   const recoveryYieldPct =
     deliveredTons > 0 ? Number(((recoveredTons / deliveredTons) * 100).toFixed(1)) : 0;
 
-  // Distinguish verified (backed by evidence) vs calculated (self-reported without uploaded doc)
-  const confidenceLevel: 'estimated' | 'calculated' | 'verified' =
-    hasRecyclingEvidence && hasWeighbridgeTicket
-      ? 'verified'
-      : hasRecyclingEvidence
-      ? 'verified'
-      : 'calculated';
+  let confidenceLevel: 'estimated' | 'calculated' | 'verified' = 'estimated';
+  if (verifierApproved) {
+    confidenceLevel = hasRecyclingEvidence && hasWeighbridgeTicket ? 'verified' : 'calculated';
+  }
 
   return {
     recoveredTons: Number(recoveredTons.toFixed(3)),
@@ -194,7 +210,8 @@ export function calculateVerifiedRecyclingImpact(params: {
     residualTons: Number(residualTons.toFixed(3)),
     lossTons: Number(lossTons.toFixed(3)),
     recoveryYieldPct,
-    transportDistanceKm: Number(transportDistanceKm.toFixed(1)),
+    transportDistanceKm: Number(safeStraightKm.toFixed(1)),
+    effectiveRoadKm,
     grossRecyclingCo2eTons,
     transportEmissionsTons,
     netVerifiedCo2eTons,

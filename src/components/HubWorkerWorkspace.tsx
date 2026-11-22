@@ -207,6 +207,8 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
   }, [isOnline, offlineQueue.length, syncOfflineQueue]);
 
   const activeHub = hubs.find((h) => h.id === selectedHubId) || hubs[0] || null;
+  const isFacilityVerified =
+    user.role === 'platform_admin' || !activeHub || activeHub.verificationStatus === 'verified';
   const netWeightKg = Math.max(0, Number((rawWeightKg - tareOffsetKg).toFixed(1)));
   const netWeightTons = Number((netWeightKg / 1000).toFixed(3));
 
@@ -457,6 +459,43 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+      {/* Strict Facility Verification Pending / Suspended Banner */}
+      {activeHub && !isFacilityVerified && (
+        <div
+          className={`rounded-xl border p-4 flex items-start gap-3 ${
+            activeHub.verificationStatus === 'suspended'
+              ? 'border-red-300 bg-red-50 text-red-900'
+              : 'border-amber-300 bg-amber-50 text-amber-950'
+          }`}
+        >
+          <AlertTriangle
+            className={`w-5 h-5 shrink-0 mt-0.5 ${
+              activeHub.verificationStatus === 'suspended' ? 'text-red-600' : 'text-amber-600'
+            }`}
+          />
+          <div className="space-y-1">
+            <h2 className="text-sm font-bold">
+              {activeHub.verificationStatus === 'suspended'
+                ? lang === 'ar'
+                  ? 'تم تعليق صلاحية إدراج المنشأة مؤقتاً'
+                  : 'Waste Generator Listing Access Suspended'
+                : lang === 'ar'
+                ? 'المنشأة قيد مراجعة الاعتماد — الإدراج في السوق موقوف مؤقتاً'
+                : 'Facility Verification Pending — Marketplace Listing Locked'}
+            </h2>
+            <p className="text-xs leading-relaxed">
+              {activeHub.verificationStatus === 'suspended'
+                ? 'Your facility account is suspended by OURO Platform Compliance. Contact operations to resolve.'
+                : 'Your B2B Waste Generator registration has been received. Publishing new Digital Waste Passports to the marketplace unlocks automatically once an OURO Admin verifies your commercial registration.'}
+            </p>
+            <p className="text-xs font-mono opacity-80 pt-0.5">
+              Facility Code: {activeHub.code} · CR: {activeHub.commercialRegNo || 'Submitted'} · Status:{' '}
+              {String(activeHub.verificationStatus).toUpperCase()}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Waste Generator Facility Header & Storage Occupancy Bar */}
       <div className="rounded-2xl bg-white border border-slate-200 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="space-y-1">
@@ -979,11 +1018,20 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
 
           <button
             type="submit"
-            disabled={submitting || uploadingPhoto || uploadingDoc}
-            className="w-full min-h-[52px] inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-base shadow-sm transition-colors disabled:opacity-60"
+            disabled={submitting || uploadingPhoto || uploadingDoc || !isFacilityVerified}
+            className="w-full min-h-[52px] inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-base shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {submitting ? (
               <Loader2 className="w-5 h-5 animate-spin" />
+            ) : !isFacilityVerified ? (
+              <>
+                <Lock className="w-5 h-5" />
+                <span>
+                  {lang === 'ar'
+                    ? 'بانتظار اعتماد المنشأة لنشر الدفعات'
+                    : 'Awaiting Compliance Verification to Publish'}
+                </span>
+              </>
             ) : (
               <>
                 <Upload className="w-5 h-5" />
