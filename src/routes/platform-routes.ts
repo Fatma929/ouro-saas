@@ -17,6 +17,13 @@ import {
 } from '../db/schema.ts';
 import { requireAuth, requireRole, type AuthRequest } from '../middleware/auth.ts';
 import { dispatchNotification, getEmailProviderStatus, notifyOrganization } from '../lib/notifications.ts';
+import { getStorageHealth } from '../lib/storage.ts';
+import {
+  getCacheProvider,
+  getDatabaseProvider,
+  getJobQueue,
+  logger,
+} from '../infra/index.ts';
 import { appendHashedPassportEvents } from '../lib/passport-chain.ts';
 import { calculateVerifiedRecyclingImpact, getEmissionFactorForCategory } from '../lib/esg-engine.ts';
 import { DISPUTE_CATEGORIES, VEHICLE_TYPES, haversineKm, type UserRole } from '../shared/constants.ts';
@@ -33,15 +40,20 @@ platformRouter.get(
   requireRole('driver_3pl', 'platform_admin'),
   async (req: AuthRequest, res) => {
     try {
+      const isAdmin = req.authUser!.role === 'platform_admin';
       const providerId = req.authUser!.logisticsProviderId;
-      const rows =
-        req.authUser!.role === 'driver_3pl' && providerId
-          ? await db
-              .select()
-              .from(logisticsVehicles)
-              .where(eq(logisticsVehicles.logisticsProviderId, providerId))
-              .orderBy(desc(logisticsVehicles.createdAt))
-          : await db.select().from(logisticsVehicles).orderBy(desc(logisticsVehicles.createdAt));
+      if (!isAdmin && !providerId) {
+        return res.status(403).json({
+          error: 'Forbidden: No 3PL logistics provider organization is linked to this account.',
+        });
+      }
+      const rows = isAdmin
+        ? await db.select().from(logisticsVehicles).orderBy(desc(logisticsVehicles.createdAt))
+        : await db
+            .select()
+            .from(logisticsVehicles)
+            .where(eq(logisticsVehicles.logisticsProviderId, providerId!))
+            .orderBy(desc(logisticsVehicles.createdAt));
 
       return res.json({ vehicles: rows });
     } catch (error) {
@@ -217,6 +229,77 @@ platformRouter.post('/api/disputes', requireAuth, async (req: AuthRequest, res) 
     }
 
     const validCategory = DISPUTE_CATEGORIES.some((c) => c.value === category) ? category : 'other';
+    const parsedReservationId = reservationId ? Number(reservationId) : null;
+    const parsedPassportId = passportId ? Number(passportId) : null;
+
+    if (parsedReservationId !== null && (!Number.isInteger(parsedReservationId) || parsedReservationId <= 0)) {
+      return res.status(400).json({ error: 'Invalid reservation ID.' });
+    }
+    if (parsedPassportId !== null && (!Number.isInteger(parsedPassportId) || parsedPassportId <= 0)) {
+      return res.status(400).json({ error: 'Invalid passport ID.' });
+    }
+
+    const user = req.authUser!;
+    const isAdmin = user.role === 'platform_admin';
+
+    if (parsedReservationId !== null) {
+      const [resRow] = await db
+        .select({
+          id: reservations.id,
+          hubId: reservations.hubId,
+          factoryId: reservations.factoryId,
+          logisticsProviderId: reservations.logisticsProviderId,
+        })
+        .from(reservations)
+        .where(eq(reservations.id, parsedReservationId))
+        .limit(1);
+      if (!resRow) {
+        return res.status(404).json({ error: 'Referenced reservation not found.' });
+      }
+      const isParty =
+        isAdmin ||
+        (user.hubId && resRow.hubId === user.hubId) ||
+        (user.factoryId && resRow.factoryId === user.factoryId) ||
+        (user.logisticsProviderId && resRow.logisticsProviderId === user.logisticsProviderId);
+      if (!isParty) {
+        return res.status(403).json({
+          error: 'Forbidden: Your organization is not a party to the referenced reservation.',
+        });
+      }
+    }
+
+    if (parsedPassportId !== null) {
+      const [pasRow] = await db
+        .select({ id: wastePassports.id, hubId: wastePassports.hubId })
+        .from(wastePassports)
+        .where(eq(wastePassports.id, parsedPassportId))
+        .limit(1);
+      if (!pasRow) {
+        return res.status(404).json({ error: 'Referenced Digital Waste Passport not found.' });
+      }
+      let isPassportParty = isAdmin || Boolean(user.hubId && pasRow.hubId === user.hubId);
+      if (!isPassportParty && (user.factoryId || user.logisticsProviderId)) {
+        const linked = await db
+          .select({
+            factoryId: reservations.factoryId,
+            logisticsProviderId: reservations.logisticsProviderId,
+          })
+          .from(reservations)
+          .where(eq(reservations.passportId, parsedPassportId))
+          .limit(20);
+        isPassportParty = linked.some(
+          (r) =>
+            (user.factoryId && r.factoryId === user.factoryId) ||
+            (user.logisticsProviderId && r.logisticsProviderId === user.logisticsProviderId)
+        );
+      }
+      if (!isPassportParty) {
+        return res.status(403).json({
+          error: 'Forbidden: Your organization is not a party to the referenced Digital Waste Passport.',
+        });
+      }
+    }
+
     const disputeCode = `OURO-DSP-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
 
     const cleanSubject = String(subject).trim().slice(0, 180);
@@ -227,8 +310,8 @@ platformRouter.post('/api/disputes', requireAuth, async (req: AuthRequest, res) 
       .insert(disputes)
       .values({
         disputeCode,
-        reservationId: reservationId ? Number(reservationId) : null,
-        passportId: passportId ? Number(passportId) : null,
+        reservationId: parsedReservationId,
+        passportId: parsedPassportId,
         raisedByUserId: req.authUser!.id,
         raisedByOrgName: orgLabel,
         category: validCategory,
@@ -848,9 +931,15 @@ platformRouter.get(
   requireRole('platform_admin'),
   async (_req, res) => {
     try {
-      const start = Date.now();
-      await db.execute(sql`SELECT 1`);
-      const dbLatencyMs = Date.now() - start;
+      const [dbHealth, storageHealth, cacheHealth] = await Promise.all([
+        getDatabaseProvider().healthCheck(),
+        getStorageHealth(),
+        getCacheProvider().healthCheck(),
+      ]);
+
+      if (!dbHealth.connected) {
+        return res.status(503).json({ status: 'degraded', error: dbHealth.error || 'Database connectivity check failed.' });
+      }
 
       const [hubC, facC, provC, vehC, passC, resC, userC, fileC, dispC] = await Promise.all([
         db.select({ c: count() }).from(wasteSourceHubs),
@@ -865,12 +954,14 @@ platformRouter.get(
       ]);
 
       return res.json({
-        status: 'healthy',
+        status: storageHealth.healthy && cacheHealth.healthy ? 'healthy' : 'degraded',
         timestamp: new Date().toISOString(),
         uptimeSeconds: Math.round(process.uptime()),
         database: {
-          connected: true,
-          latencyMs: dbLatencyMs,
+          connected: dbHealth.connected,
+          latencyMs: dbHealth.latencyMs,
+          connectionMode: dbHealth.connectionMode,
+          sslMode: dbHealth.sslMode,
           tables: {
             wasteGenerators: hubC[0]?.c ?? 0,
             recyclingFactories: facC[0]?.c ?? 0,
@@ -883,15 +974,14 @@ platformRouter.get(
             disputes: dispC[0]?.c ?? 0,
           },
         },
-        storage: {
-          mode: 'confined_private_disk_with_signed_urls',
-          magicByteValidation: true,
-          sha256Integrity: true,
-        },
+        storage: storageHealth,
+        cache: cacheHealth,
         notifications: getEmailProviderStatus(),
+        jobs: getJobQueue().getMetrics(),
+        logging: logger.getStatus(),
       });
     } catch (error) {
-      console.error('System health check error:', error);
+      logger.error('system_health_check_error', { error });
       return res.status(503).json({ status: 'degraded', error: 'Database connectivity check failed.' });
     }
   }

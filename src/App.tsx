@@ -67,6 +67,11 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // best-effort server-side token revocation
+    }
     setAuthToken(null);
     setUser(null);
     setInspectPassportCode(null);

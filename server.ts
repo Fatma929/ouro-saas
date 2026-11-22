@@ -3,9 +3,17 @@ import http from 'http';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import path from 'path';
 import multer from 'multer';
-import { createServer as createViteServer } from 'vite';
 import { eq, desc, asc, or, and, gte, ne, sql } from 'drizzle-orm';
 import { db } from './src/db/index.ts';
+import {
+  bootstrapInfrastructure,
+  getCacheProvider,
+  getDatabaseProvider,
+  logger,
+  resolveInfraConfig,
+  shutdownInfrastructure,
+  validateEnvironmentConfig,
+} from './src/infra/index.ts';
 import {
   users,
   wasteSourceHubs,
@@ -31,6 +39,7 @@ import {
 } from './src/middleware/auth.ts';
 import {
   securityHeadersMiddleware,
+  createCorsMiddleware,
   createRateLimiter,
   sanitizeCsvCell,
   logStructured,
@@ -41,6 +50,9 @@ import {
   validateFileMagicBytes,
   storePrivateFile,
   readPrivateFile,
+  deletePrivateFile,
+  getPrivateFileMetadata,
+  getSignedFileDownloadUrl,
   signFileAccessToken,
   verifyFileAccessToken,
   canUserAccessFile,
@@ -58,9 +70,10 @@ import {
   notifyOrganization,
 } from './src/lib/notifications.ts';
 import {
-  hashPassword,
-  verifyPassword,
+  hashPasswordAsync,
+  verifyPasswordAsync,
   signSessionToken,
+  revokeSessionToken,
   generatePassportCode,
   generateReservationCode,
 } from './src/lib/auth-utils.ts';
@@ -75,17 +88,24 @@ import {
 } from './src/shared/constants.ts';
 import { platformRouter } from './src/routes/platform-routes.ts';
 
-const app = express();
-app.use(securityHeadersMiddleware);
-app.use(express.json({ limit: '10mb' }));
+const infraBootConfig = resolveInfraConfig();
 
-// Rate limiters (generous for pilot & automated QA while blocking brute-force abuse)
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', infraBootConfig.http.trustProxy);
+app.use(securityHeadersMiddleware);
+app.use('/api', createCorsMiddleware(infraBootConfig.http.allowedOrigins));
+app.use(express.json({ limit: '1mb' }));
+
+// Rate limiters backed by cloud-agnostic CacheProvider (Memory in dev, Redis in multi-instance prod)
 const authLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 60, bucketName: 'auth' });
 const uploadLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 40, bucketName: 'upload' });
+const apiLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 300, bucketName: 'api' });
+app.use('/api', apiLimiter);
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 },
+  limits: { fileSize: infraBootConfig.storage.maxFileSizeBytes },
   fileFilter: (_req, file, cb) => {
     if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
       cb(null, true);
@@ -202,13 +222,99 @@ async function canUserAccessFileWithLinks(
   return false;
 }
 
+/**
+ * Verifies that a caller is authorized to attach a previously uploaded file_objects.id
+ * to a passport or reservation (prevents cross-organization private file hijacking).
+ */
+async function assertFileAttachable(
+  executor: Pick<typeof db, 'select'>,
+  rawFileId: unknown,
+  authUser: AuthenticatedUser,
+  allowedPurposes: string[]
+): Promise<number | null> {
+  if (rawFileId === undefined || rawFileId === null || rawFileId === '') return null;
+  const fileId = Number(rawFileId);
+  if (!Number.isInteger(fileId) || fileId <= 0) {
+    throw new Error('FILE_NOT_FOUND');
+  }
+  const rows = await executor
+    .select({
+      id: fileObjects.id,
+      purpose: fileObjects.purpose,
+      uploadedByUid: fileObjects.uploadedByUid,
+      ownerOrgType: fileObjects.ownerOrgType,
+      ownerOrgId: fileObjects.ownerOrgId,
+    })
+    .from(fileObjects)
+    .where(eq(fileObjects.id, fileId))
+    .limit(1);
+
+  if (rows.length === 0) {
+    throw new Error('FILE_NOT_FOUND');
+  }
+  const f = rows[0];
+  if (allowedPurposes.length > 0 && !allowedPurposes.includes(f.purpose)) {
+    throw new Error('FILE_PURPOSE_MISMATCH');
+  }
+  if (authUser.role === 'platform_admin') return f.id;
+  if (f.uploadedByUid && f.uploadedByUid === authUser.uid) return f.id;
+  if (f.ownerOrgType === 'hub' && authUser.hubId && f.ownerOrgId === authUser.hubId) return f.id;
+  if (f.ownerOrgType === 'factory' && authUser.factoryId && f.ownerOrgId === authUser.factoryId) return f.id;
+  if (
+    f.ownerOrgType === 'logistics_provider' &&
+    authUser.logisticsProviderId &&
+    f.ownerOrgId === authUser.logisticsProviderId
+  ) {
+    return f.id;
+  }
+  throw new Error('FILE_FORBIDDEN');
+}
+
+/**
+ * Signs internal /api/storage/:id weighin_photo URLs with a short-lived HMAC token
+ * so authenticated marketplace/passport UIs render images securely while blocking unauthenticated scraping.
+ */
+function signPhotoUrlForUser(
+  photoFileId: number | null | undefined,
+  photoUrl: string | null | undefined,
+  userId: number
+): string | null {
+  if (!photoUrl) return null;
+  const match = photoUrl.match(/^\/api\/storage\/(\d+)$/);
+  const targetId = photoFileId && photoFileId > 0 ? photoFileId : match ? Number(match[1]) : null;
+  if (targetId && photoUrl.startsWith('/api/storage/')) {
+    const sig = signFileAccessToken(targetId, userId, 3600);
+    return `/api/storage/${targetId}?sig=${encodeURIComponent(sig)}`;
+  }
+  return photoUrl;
+}
+
+// Public liveness probe mounted BEFORE DB middleware (fast, zero DB coupling for container orchestrators)
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+// Readiness probe for cloud load balancers (verifies live PostgreSQL & distributed cache if enabled)
+app.get('/api/ready', async (_req, res) => {
+  const [dbHealth, cacheHealth] = await Promise.all([
+    getDatabaseProvider().healthCheck(),
+    getCacheProvider().healthCheck(),
+  ]);
+  const ready = dbHealth.connected && cacheHealth.healthy;
+  return res.status(ready ? 200 : 503).json({
+    ready,
+    database: dbHealth.connected,
+    cache: cacheHealth.healthy,
+  });
+});
+
 // Middleware to ensure pilot seed & idempotent schema backfills run lazily on first API call
 app.use('/api', async (_req, res, next) => {
   try {
     await ensureSeeded();
     next();
   } catch (err) {
-    console.error('Database initialization error:', err);
+    logger.error('database_initialization_error', { error: err });
     res.status(503).json({ error: 'Database service temporarily unavailable. Please retry.' });
   }
 });
@@ -242,7 +348,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       )
       .limit(1);
 
-    if (matched.length === 0 || !verifyPassword(password, matched[0].passwordHash)) {
+    if (matched.length === 0 || !(await verifyPasswordAsync(password, matched[0].passwordHash))) {
       return res.status(401).json({ error: 'Invalid credentials. Please check your ID/email and password.' });
     }
 
@@ -388,7 +494,7 @@ app.post('/api/auth/register-factory', authLimiter, upload.single('kycDocument')
         .values({
           uid,
           email: cleanEmail,
-          passwordHash: hashPassword(String(password)),
+          passwordHash: await hashPasswordAsync(String(password)),
           fullName: String(contactPerson).trim(),
           phone: String(phone).trim(),
           accountCode,
@@ -520,7 +626,7 @@ app.post('/api/auth/register-generator', authLimiter, async (req, res) => {
         .values({
           uid,
           email: cleanEmail,
-          passwordHash: hashPassword(String(password)),
+          passwordHash: await hashPasswordAsync(String(password)),
           fullName: String(contactPerson).trim(),
           phone: String(phone).trim(),
           accountCode,
@@ -573,6 +679,19 @@ app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
   } catch (error) {
     console.error('Failed to load profile:', error);
     return res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
+    const revoked = token.startsWith('ouro.') ? await revokeSessionToken(token) : false;
+    logStructured('info', 'user_logout', { userId: req.authUser!.id, revoked });
+    return res.json({ ok: true, revoked });
+  } catch (error) {
+    logger.error('logout_error', { error });
+    return res.status(500).json({ error: 'Failed to revoke session.' });
   }
 });
 
@@ -669,14 +788,129 @@ app.post('/api/storage/:id/sign', requireAuth, async (req: AuthRequest, res) => 
     if (!allowed) {
       return res.status(403).json({ error: 'Forbidden: You do not have permission to access this file.' });
     }
-    const sig = signFileAccessToken(file.id, req.authUser!.id, 300);
+    const signed = await getSignedFileDownloadUrl({
+      key: file.storagePath || '',
+      fileId: file.id,
+      userId: req.authUser!.id,
+      ttlSeconds: 300,
+      downloadFilename: file.originalName,
+      contentType: file.mimeType,
+    });
     return res.json({
-      signedUrl: `/api/storage/${file.id}?sig=${encodeURIComponent(sig)}`,
-      expiresInSeconds: 300,
+      signedUrl: signed.url,
+      expiresInSeconds: signed.expiresInSeconds,
+      provider: signed.provider,
+      mode: signed.mode,
     });
   } catch (error) {
-    console.error('Sign file URL error:', error);
+    logger.error('sign_file_url_error', { error });
     return res.status(500).json({ error: 'Failed to sign file download URL.' });
+  }
+});
+
+app.get('/api/storage/:id/metadata', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid file ID' });
+    }
+    const rows = await db.select().from(fileObjects).where(eq(fileObjects.id, id)).limit(1);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    const file = rows[0];
+    const allowed = await canUserAccessFileWithLinks(req.authUser!, file);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Forbidden: You do not have permission to inspect this file.' });
+    }
+    const objectMeta = file.storagePath ? await getPrivateFileMetadata(file.storagePath) : null;
+    return res.json({
+      id: file.id,
+      originalName: file.originalName,
+      mimeType: file.mimeType,
+      sizeBytes: file.sizeBytes,
+      purpose: file.purpose,
+      sha256: file.sha256,
+      createdAt: file.createdAt,
+      storage: objectMeta
+        ? {
+            provider: objectMeta.provider,
+            exists: true,
+            sizeBytes: objectMeta.sizeBytes,
+            lastModified: objectMeta.lastModified,
+          }
+        : {
+            provider: infraBootConfig.storage.provider,
+            exists: Boolean(file.dataBase64),
+          },
+    });
+  } catch (error) {
+    logger.error('storage_metadata_error', { error });
+    return res.status(500).json({ error: 'Failed to load file metadata.' });
+  }
+});
+
+app.delete('/api/storage/:id', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid file ID' });
+    }
+    const rows = await db.select().from(fileObjects).where(eq(fileObjects.id, id)).limit(1);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    const file = rows[0];
+    const isAdmin = req.authUser!.role === 'platform_admin';
+    const isUploader = Boolean(file.uploadedByUid && file.uploadedByUid === req.authUser!.uid);
+    if (!isAdmin && !isUploader) {
+      return res.status(403).json({ error: 'Forbidden: Only the uploader or a platform admin can delete this file.' });
+    }
+
+    // Preserve audit evidence integrity: block deletion if referenced by a passport, reservation, or KYC record
+    const [linkedPassports, linkedReservations, linkedFactories] = await Promise.all([
+      db
+        .select({ id: wastePassports.id })
+        .from(wastePassports)
+        .where(
+          or(
+            eq(wastePassports.supportingDocFileId, file.id),
+            eq(wastePassports.photoFileId, file.id)
+          )
+        )
+        .limit(1),
+      db
+        .select({ id: reservations.id })
+        .from(reservations)
+        .where(
+          or(
+            eq(reservations.podFileId, file.id),
+            eq(reservations.weighbridgeFileId, file.id),
+            eq(reservations.recyclingEvidenceFileId, file.id)
+          )
+        )
+        .limit(1),
+      db
+        .select({ id: recyclingFactories.id })
+        .from(recyclingFactories)
+        .where(eq(recyclingFactories.kycDocumentFileId, file.id))
+        .limit(1),
+    ]);
+
+    if (linkedPassports.length > 0 || linkedReservations.length > 0 || linkedFactories.length > 0) {
+      return res.status(409).json({
+        error: 'Cannot delete file because it is linked to an active audit, passport, reservation, or KYC record.',
+      });
+    }
+
+    if (file.storagePath) {
+      await deletePrivateFile(file.storagePath);
+    }
+    await db.delete(fileObjects).where(eq(fileObjects.id, file.id));
+    return res.json({ deleted: true, id: file.id });
+  } catch (error) {
+    logger.error('storage_delete_error', { error });
+    return res.status(500).json({ error: 'Failed to delete file.' });
   }
 });
 
@@ -692,32 +926,30 @@ app.get('/api/storage/:id', async (req, res) => {
     }
     const file = rows[0];
 
-    // Enforce strict verified auth & object-level authorization for ALL non-weighin_photo files
-    if (file.purpose !== 'weighin_photo') {
-      const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';
-      let authorized = false;
+    // Enforce strict verified auth OR short-lived HMAC signed URL for ALL stored files (including weighin_photo)
+    const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';
+    let authorized = false;
 
-      if (sigParam) {
-        const verified = verifyFileAccessToken(file.id, sigParam);
-        if (verified) {
-          authorized = true;
-        }
+    if (sigParam) {
+      const verified = verifyFileAccessToken(file.id, sigParam);
+      if (verified) {
+        authorized = true;
       }
+    }
 
-      if (!authorized) {
-        let user: AuthenticatedUser | null = null;
-        try {
-          user = await resolveUserFromBearer(req.headers.authorization);
-        } catch {
-          user = null;
-        }
-        if (!user) {
-          return res.status(401).json({ error: 'Unauthorized: Valid authentication or signed token required.' });
-        }
-        const allowed = await canUserAccessFileWithLinks(user, file);
-        if (!allowed) {
-          return res.status(403).json({ error: 'Forbidden: Access to this private document is restricted.' });
-        }
+    if (!authorized) {
+      let user: AuthenticatedUser | null = null;
+      try {
+        user = await resolveUserFromBearer(req.headers.authorization);
+      } catch {
+        user = null;
+      }
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized: Valid authentication or signed token required.' });
+      }
+      const allowed = await canUserAccessFileWithLinks(user, file);
+      if (!allowed) {
+        return res.status(403).json({ error: 'Forbidden: Access to this private document is restricted.' });
       }
     }
 
@@ -820,7 +1052,10 @@ app.get(
       return res.json({
         assignedHub,
         hubs: allHubs,
-        recentPassports: hubPassports,
+        recentPassports: hubPassports.map((p) => ({
+          ...p,
+          photoUrl: signPhotoUrlForUser(p.photoFileId, p.photoUrl, req.authUser!.id),
+        })),
         incomingReservations: incomingResRows.map((r) => ({
           ...r.reservation,
           passportCode: r.passport.passportCode,
@@ -925,14 +1160,24 @@ app.post(
           throw new Error('GENERATOR_VERIFICATION_PENDING');
         }
 
+        // Verify file ownership & purpose before linking to passport (prevents cross-org attachment hijacking)
+        const verifiedPhotoFileId = await assertFileAttachable(tx, photoFileId, req.authUser!, [
+          'weighin_photo',
+        ]);
+        const verifiedSupportingDocFileId = await assertFileAttachable(
+          tx,
+          supportingDocFileId,
+          req.authUser!,
+          ['supporting_doc']
+        );
+
         const newAvailableTons = Number((hub.availableTons + weightTons).toFixed(3));
         const passportCode = generatePassportCode();
-        const resolvedPhotoUrl =
-          photoFileId && Number(photoFileId) > 0
-            ? `/api/storage/${Number(photoFileId)}`
-            : typeof photoUrl === 'string' && photoUrl.startsWith('/')
-            ? photoUrl
-            : meta.defaultPhoto;
+        const resolvedPhotoUrl = verifiedPhotoFileId
+          ? `/api/storage/${verifiedPhotoFileId}`
+          : typeof photoUrl === 'string' && photoUrl.startsWith('/') && !photoUrl.startsWith('/api/storage/')
+          ? photoUrl
+          : meta.defaultPhoto;
 
         const [createdPassport] = await tx
           .insert(wastePassports)
@@ -952,9 +1197,9 @@ app.post(
             rejectedTons: 0,
             pricePerTonEgp: rateEgp,
             verificationMethod: method,
-            photoFileId: photoFileId ? Number(photoFileId) : null,
+            photoFileId: verifiedPhotoFileId,
             photoUrl: resolvedPhotoUrl,
-            supportingDocFileId: supportingDocFileId ? Number(supportingDocFileId) : null,
+            supportingDocFileId: verifiedSupportingDocFileId,
             supportingDocName: supportingDocName ? String(supportingDocName).trim().slice(0, 140) : null,
             notes: notes ? String(notes).trim().slice(0, 1000) : null,
             pickupWindow: String(pickupWindow || 'Daily 08:00 - 15:00 EET').trim(),
@@ -1027,6 +1272,15 @@ app.post(
             'Verification Pending: Your Waste Generator facility must be verified by OURO Compliance before publishing marketplace listings.',
           code: 'GENERATOR_VERIFICATION_PENDING',
         });
+      }
+      if (error?.message === 'FILE_NOT_FOUND') {
+        return res.status(404).json({ error: 'Referenced attachment file not found.' });
+      }
+      if (error?.message === 'FILE_FORBIDDEN') {
+        return res.status(403).json({ error: 'Forbidden: You cannot attach files belonging to another organization.' });
+      }
+      if (error?.message === 'FILE_PURPOSE_MISMATCH') {
+        return res.status(400).json({ error: 'Attachment file purpose does not match the requested field.' });
       }
       console.error('Passport minting error:', error);
       return res.status(500).json({ error: 'Failed to mint Digital Waste Passport.' });
@@ -1189,14 +1443,18 @@ app.get(
   requireRole('generator_ops', 'platform_admin'),
   async (req: AuthRequest, res) => {
     try {
-      const scope =
-        req.authUser!.role === 'generator_ops' && req.authUser!.hubId
-          ? eq(wastePassports.hubId, req.authUser!.hubId)
-          : undefined;
+      const isAdmin = req.authUser!.role === 'platform_admin';
+      if (!isAdmin && !req.authUser!.hubId) {
+        return res.status(403).json({ error: 'Forbidden: No Waste Generator facility is linked to this account.' });
+      }
 
-      const rows = scope
-        ? await db.select().from(wastePassports).where(scope).orderBy(desc(wastePassports.createdAt))
-        : await db.select().from(wastePassports).orderBy(desc(wastePassports.createdAt));
+      const rows = isAdmin
+        ? await db.select().from(wastePassports).orderBy(desc(wastePassports.createdAt))
+        : await db
+            .select()
+            .from(wastePassports)
+            .where(eq(wastePassports.hubId, req.authUser!.hubId!))
+            .orderBy(desc(wastePassports.createdAt));
 
       const headers = [
         'Passport_Code',
@@ -1362,7 +1620,10 @@ app.get('/api/passports/:codeOrId', requireAuth, async (req: AuthRequest, res) =
       : eventsById;
 
     return res.json({
-      passport,
+      passport: {
+        ...passport,
+        photoUrl: signPhotoUrlForUser(passport.photoFileId, passport.photoUrl, req.authUser!.id),
+      },
       hub: hubRows[0] || null,
       events: scopedEvents,
       chainIntegrity,
@@ -1389,60 +1650,68 @@ app.get('/api/passports/:codeOrId', requireAuth, async (req: AuthRequest, res) =
 // 5. RECYCLING FACTORY MARKETPLACE, PROFILE, ATOMIC RESERVATIONS & RECYCLING VERIFICATION
 // ============================================================================
 
-app.get('/api/marketplace/lots', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const [allLots, allHubs, factoryRows, factoryResRows] = await Promise.all([
-      db
-        .select({
-          passport: wastePassports,
-          hub: wasteSourceHubs,
-        })
-        .from(wastePassports)
-        .innerJoin(wasteSourceHubs, eq(wastePassports.hubId, wasteSourceHubs.id))
-        .where(and(gte(wastePassports.availableTons, 0.5), ne(wastePassports.status, 'cancelled')))
-        .orderBy(desc(wastePassports.createdAt)),
-      db.select().from(wasteSourceHubs),
-      req.authUser!.factoryId
-        ? db
-            .select()
-            .from(recyclingFactories)
-            .where(eq(recyclingFactories.id, req.authUser!.factoryId))
-            .limit(1)
-        : Promise.resolve([]),
-      req.authUser!.factoryId
-        ? db
-            .select()
-            .from(reservations)
-            .where(eq(reservations.factoryId, req.authUser!.factoryId))
-        : db.select().from(reservations),
-    ]);
+app.get(
+  '/api/marketplace/lots',
+  requireAuth,
+  requireRole('factory_procurement', 'platform_admin'),
+  async (req: AuthRequest, res) => {
+    try {
+      const isAdmin = req.authUser!.role === 'platform_admin';
+      const [allLots, allHubs, factoryRows, factoryResRows] = await Promise.all([
+        db
+          .select({
+            passport: wastePassports,
+            hub: wasteSourceHubs,
+          })
+          .from(wastePassports)
+          .innerJoin(wasteSourceHubs, eq(wastePassports.hubId, wasteSourceHubs.id))
+          .where(and(gte(wastePassports.availableTons, 0.5), ne(wastePassports.status, 'cancelled')))
+          .orderBy(desc(wastePassports.createdAt)),
+        db.select().from(wasteSourceHubs),
+        req.authUser!.factoryId
+          ? db
+              .select()
+              .from(recyclingFactories)
+              .where(eq(recyclingFactories.id, req.authUser!.factoryId))
+              .limit(1)
+          : Promise.resolve([]),
+        isAdmin
+          ? db.select().from(reservations)
+          : req.authUser!.factoryId
+          ? db
+              .select()
+              .from(reservations)
+              .where(eq(reservations.factoryId, req.authUser!.factoryId))
+          : Promise.resolve([]),
+      ]);
 
-    const factory = factoryRows[0] || null;
-    let preferredCats: string[] = ['paper_cardboard', 'plastics'];
-    if (factory?.preferredCategories) {
-      try {
-        preferredCats = JSON.parse(factory.preferredCategories);
-      } catch {
-        preferredCats = ['paper_cardboard', 'plastics'];
+      const factory = factoryRows[0] || null;
+      let preferredCats: string[] = ['paper_cardboard', 'plastics'];
+      if (factory?.preferredCategories) {
+        try {
+          preferredCats = JSON.parse(factory.preferredCategories);
+        } catch {
+          preferredCats = ['paper_cardboard', 'plastics'];
+        }
       }
-    }
-    const factoryLat = factory?.lat ?? 29.9697;
-    const factoryLng = factory?.lng ?? 30.9462;
+      const factoryLat = factory?.lat ?? 29.9697;
+      const factoryLng = factory?.lng ?? 30.9462;
 
-    const lotsWithSmartMatch = allLots.map(({ passport, hub }) => {
-      const distanceKm = Number(haversineKm(factoryLat, factoryLng, hub.lat, hub.lng).toFixed(1));
-      let score = 45;
-      if (preferredCats.includes(passport.materialCategory)) score += 28;
-      if (passport.purityGrade === 'Grade A') score += 14;
-      else if (passport.purityGrade === 'Grade B') score += 7;
-      if (distanceKm <= 25) score += 11;
-      else if (distanceKm <= 55) score += 7;
-      else if (distanceKm <= 90) score += 3;
-      if (passport.availableTons >= 5) score += 2;
-      const smartMatchScore = Math.min(99, Math.max(52, Math.round(score)));
+      const lotsWithSmartMatch = allLots.map(({ passport, hub }) => {
+        const distanceKm = Number(haversineKm(factoryLat, factoryLng, hub.lat, hub.lng).toFixed(1));
+        let score = 45;
+        if (preferredCats.includes(passport.materialCategory)) score += 28;
+        if (passport.purityGrade === 'Grade A') score += 14;
+        else if (passport.purityGrade === 'Grade B') score += 7;
+        if (distanceKm <= 25) score += 11;
+        else if (distanceKm <= 55) score += 7;
+        else if (distanceKm <= 90) score += 3;
+        if (passport.availableTons >= 5) score += 2;
+        const smartMatchScore = Math.min(99, Math.max(52, Math.round(score)));
 
-      return {
-        ...passport,
+        return {
+          ...passport,
+          photoUrl: signPhotoUrlForUser(passport.photoFileId, passport.photoUrl, req.authUser!.id),
         hub: {
           id: hub.id,
           code: hub.code,
@@ -1522,9 +1791,12 @@ app.patch(
   requireRole('factory_procurement', 'platform_admin'),
   async (req: AuthRequest, res) => {
     try {
-      const factoryId = req.authUser!.factoryId || Number(req.body?.factoryId);
+      const isAdmin = req.authUser!.role === 'platform_admin';
+      const factoryId = isAdmin
+        ? req.authUser!.factoryId || Number(req.body?.factoryId)
+        : req.authUser!.factoryId;
       if (!factoryId) {
-        return res.status(400).json({ error: 'No recycling facility linked to this account.' });
+        return res.status(403).json({ error: 'Forbidden: No recycling facility is linked to this account.' });
       }
       const { preferredCategories, monthlyCapacityTons, acceptedGrades, procurementNotes } = req.body || {};
 
@@ -1540,6 +1812,10 @@ app.patch(
       }
       if (typeof procurementNotes === 'string') {
         updates.procurementNotes = procurementNotes.trim().slice(0, 1000);
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: 'No valid profile fields provided to update.' });
       }
 
       const [saved] = await db
@@ -1576,9 +1852,14 @@ app.get(
         .innerJoin(logisticsProviders, eq(reservations.logisticsProviderId, logisticsProviders.id))
         .orderBy(desc(reservations.createdAt));
 
-      const rows = req.authUser!.factoryId
-        ? await query.where(eq(reservations.factoryId, req.authUser!.factoryId))
-        : await query;
+      const isAdmin = req.authUser!.role === 'platform_admin';
+      if (!isAdmin && !req.authUser!.factoryId) {
+        return res.status(403).json({ error: 'Forbidden: No recycling facility is linked to this account.' });
+      }
+
+      const rows = isAdmin
+        ? await query
+        : await query.where(eq(reservations.factoryId, req.authUser!.factoryId!));
 
       return res.json({
         reservations: rows.map((r) => ({
@@ -2026,13 +2307,20 @@ app.post(
           throw new Error('NOT_YET_DELIVERED');
         }
 
+        const verifiedWeighbridgeFileId = await assertFileAttachable(
+          tx,
+          weighbridgeFileId,
+          req.authUser!,
+          ['weighbridge_ticket', 'supporting_doc']
+        );
+
         const [savedRes] = await tx
           .update(reservations)
           .set({
             receiptStatus: 'received',
             receivedAt: new Date(),
             receivedWeightKg: weightKgNum,
-            weighbridgeFileId: weighbridgeFileId ? Number(weighbridgeFileId) : current.weighbridgeFileId,
+            weighbridgeFileId: verifiedWeighbridgeFileId ?? current.weighbridgeFileId,
             weighbridgeFileName: weighbridgeFileName
               ? String(weighbridgeFileName).trim().slice(0, 140)
               : current.weighbridgeFileName,
@@ -2083,6 +2371,13 @@ app.post(
       if (msg === 'NOT_YET_DELIVERED') {
         return res.status(409).json({ error: 'Shipment must be marked delivered by 3PL before confirming facility receipt.' });
       }
+      if (msg === 'FILE_NOT_FOUND') return res.status(404).json({ error: 'Weighbridge attachment file not found.' });
+      if (msg === 'FILE_FORBIDDEN') {
+        return res.status(403).json({ error: 'Forbidden: You cannot attach files belonging to another organization.' });
+      }
+      if (msg === 'FILE_PURPOSE_MISMATCH') {
+        return res.status(400).json({ error: 'Attachment file purpose must be weighbridge_ticket or supporting_doc.' });
+      }
       console.error('Confirm factory receipt error:', error);
       return res.status(500).json({ error: 'Failed to confirm physical receipt.' });
     }
@@ -2131,6 +2426,11 @@ app.post(
         }
         if (current.pickupStatus !== 'delivered') throw new Error('NOT_YET_DELIVERED');
         if (current.recyclingStatus === 'verified_recycled') throw new Error('ALREADY_RECYCLED');
+
+        await assertFileAttachable(tx, recyclingEvidenceFileId, req.authUser!, [
+          'recycling_evidence',
+          'supporting_doc',
+        ]);
 
         await tx.execute(sql`SELECT id FROM waste_passports WHERE id = ${current.passportId} FOR UPDATE`);
         const [passport] = await tx
@@ -2343,6 +2643,13 @@ app.post(
           error: `Mass balance violation: recovered + residual + loss exceeds delivered tonnage (${basis} t + 5% weighbridge tolerance).`,
         });
       }
+      if (msg === 'FILE_NOT_FOUND') return res.status(404).json({ error: 'Recycling evidence file not found.' });
+      if (msg === 'FILE_FORBIDDEN') {
+        return res.status(403).json({ error: 'Forbidden: You cannot attach files belonging to another organization.' });
+      }
+      if (msg === 'FILE_PURPOSE_MISMATCH') {
+        return res.status(400).json({ error: 'Attachment file purpose must be recycling_evidence or supporting_doc.' });
+      }
       console.error('Verify recycling outcome error:', error);
       return res.status(500).json({ error: 'Failed to record verified recycling outcome.' });
     }
@@ -2493,6 +2800,9 @@ app.patch(
           throw new Error('SHIPMENT_CANCELLED');
         }
 
+        await tx.execute(sql`SELECT id FROM waste_passports WHERE id = ${current.passportId} FOR UPDATE`);
+        await tx.execute(sql`SELECT id FROM waste_source_hubs WHERE id = ${current.hubId} FOR UPDATE`);
+
         const [passport] = await tx
           .select()
           .from(wastePassports)
@@ -2519,6 +2829,9 @@ app.patch(
         if (nextIdx <= curIdx) {
           throw new Error('INVALID_TRANSITION');
         }
+        if (nextIdx !== curIdx + 1) {
+          throw new Error(`STAGE_SKIP_FORBIDDEN:${PICKUP_STATUS_FLOW[curIdx + 1]}`);
+        }
 
         const latVal = Number.isFinite(Number(gpsLat)) ? Number(gpsLat) : hub.lat;
         const lngVal = Number.isFinite(Number(gpsLng)) ? Number(gpsLng) : hub.lng;
@@ -2528,8 +2841,23 @@ app.patch(
           updatedAt: new Date(),
         };
 
-        if (vehicleId && Number.isInteger(Number(vehicleId))) {
-          updatePayload.vehicleId = Number(vehicleId);
+        if (vehicleId !== undefined && vehicleId !== null && vehicleId !== '') {
+          const parsedVehicleId = Number(vehicleId);
+          if (!Number.isInteger(parsedVehicleId) || parsedVehicleId <= 0) {
+            throw new Error('VEHICLE_NOT_FOUND');
+          }
+          const [veh] = await tx
+            .select()
+            .from(logisticsVehicles)
+            .where(eq(logisticsVehicles.id, parsedVehicleId))
+            .limit(1);
+          if (!veh || !veh.isActive) {
+            throw new Error('VEHICLE_NOT_FOUND');
+          }
+          if (veh.logisticsProviderId !== current.logisticsProviderId) {
+            throw new Error('VEHICLE_FORBIDDEN');
+          }
+          updatePayload.vehicleId = veh.id;
         }
 
         if (nextStatus === 'accepted') {
@@ -2579,13 +2907,14 @@ app.patch(
         }
 
         if (nextStatus === 'picked_up') {
-          if (qrPassportCode) {
-            const rawQr = String(qrPassportCode).trim();
-            const matched = rawQr.match(/OURO-PAS-\d{4}-[A-Z0-9]{4,10}/i);
-            const normalizedQr = (matched ? matched[0] : rawQr).toUpperCase();
-            if (normalizedQr !== passport.passportCode.toUpperCase()) {
-              throw new Error('QR_MISMATCH');
-            }
+          const rawQr = typeof qrPassportCode === 'string' ? qrPassportCode.trim() : '';
+          if (!rawQr) {
+            throw new Error('QR_REQUIRED');
+          }
+          const matched = rawQr.match(/OURO-PAS-\d{4}-[A-Z0-9]{4,10}/i);
+          const normalizedQr = (matched ? matched[0] : rawQr).toUpperCase();
+          if (normalizedQr !== passport.passportCode.toUpperCase()) {
+            throw new Error('QR_MISMATCH');
           }
           const verifiedWeightKg =
             Number(handoffWeightKg) > 0 ? Number(handoffWeightKg) : Math.round(current.quantityTons * 1000);
@@ -2652,8 +2981,13 @@ app.patch(
             ? Number((current.handoffWeightKg / 1000).toFixed(3))
             : current.quantityTons;
 
+          const verifiedPodFileId = await assertFileAttachable(tx, podFileId, req.authUser!, [
+            'pod_document',
+            'supporting_doc',
+          ]);
+
           updatePayload.deliveredAt = new Date();
-          if (podFileId) updatePayload.podFileId = Number(podFileId);
+          if (verifiedPodFileId) updatePayload.podFileId = verifiedPodFileId;
           if (podFileName) updatePayload.podFileName = String(podFileName).trim().slice(0, 140);
           // Do NOT claim verified CO2e at delivery!
           updatePayload.co2eAvoidedTons = 0;
@@ -2736,10 +3070,34 @@ app.patch(
       if (msg === 'INVALID_TRANSITION') {
         return res.status(400).json({ error: 'Pickup status cannot move backwards or repeat.' });
       }
+      if (msg.startsWith('STAGE_SKIP_FORBIDDEN:')) {
+        const expectedNext = msg.split(':')[1];
+        return res.status(409).json({
+          error: `Strict chain-of-custody order enforced: next required status is "${expectedNext}".`,
+        });
+      }
+      if (msg === 'QR_REQUIRED') {
+        return res.status(400).json({
+          error: 'On-site Digital Waste Passport QR code scan is mandatory before confirming pickup.',
+        });
+      }
       if (msg === 'QR_MISMATCH') {
         return res.status(400).json({
           error: 'Scanned Passport QR code does not match this assigned lot. Please verify the physical label.',
         });
+      }
+      if (msg === 'VEHICLE_NOT_FOUND') {
+        return res.status(400).json({ error: 'Selected 3PL vehicle does not exist or is inactive.' });
+      }
+      if (msg === 'VEHICLE_FORBIDDEN') {
+        return res.status(403).json({ error: 'Forbidden: Selected vehicle does not belong to the assigned 3PL carrier.' });
+      }
+      if (msg === 'FILE_NOT_FOUND') return res.status(404).json({ error: 'POD attachment file not found.' });
+      if (msg === 'FILE_FORBIDDEN') {
+        return res.status(403).json({ error: 'Forbidden: You cannot attach files belonging to another organization.' });
+      }
+      if (msg === 'FILE_PURPOSE_MISMATCH') {
+        return res.status(400).json({ error: 'POD attachment file purpose must be pod_document or supporting_doc.' });
       }
       console.error('Driver status transition error:', error);
       return res.status(500).json({ error: 'Failed to update pickup status.' });
@@ -3306,18 +3664,19 @@ app.get(
   requireRole('platform_admin', 'factory_procurement', 'generator_ops'),
   async (req: AuthRequest, res) => {
     try {
-      const scopeCondition =
-        req.authUser!.role === 'factory_procurement' && req.authUser!.factoryId
-          ? and(
-              eq(reservations.pickupStatus, 'delivered'),
-              eq(reservations.factoryId, req.authUser!.factoryId)
-            )
-          : req.authUser!.role === 'generator_ops' && req.authUser!.hubId
-          ? and(
-              eq(reservations.pickupStatus, 'delivered'),
-              eq(reservations.hubId, req.authUser!.hubId)
-            )
-          : eq(reservations.pickupStatus, 'delivered');
+      const isAdmin = req.authUser!.role === 'platform_admin';
+      if (req.authUser!.role === 'factory_procurement' && !req.authUser!.factoryId) {
+        return res.status(403).json({ error: 'Forbidden: No recycling facility is linked to this account.' });
+      }
+      if (req.authUser!.role === 'generator_ops' && !req.authUser!.hubId) {
+        return res.status(403).json({ error: 'Forbidden: No Waste Generator facility is linked to this account.' });
+      }
+
+      const scopeCondition = isAdmin
+        ? eq(reservations.pickupStatus, 'delivered')
+        : req.authUser!.role === 'factory_procurement'
+        ? and(eq(reservations.pickupStatus, 'delivered'), eq(reservations.factoryId, req.authUser!.factoryId!))
+        : and(eq(reservations.pickupStatus, 'delivered'), eq(reservations.hubId, req.authUser!.hubId!));
 
       const [rows, factorMap] = await Promise.all([
         db
@@ -3456,18 +3815,25 @@ app.get(
   requireRole('platform_admin', 'factory_procurement', 'generator_ops'),
   async (req: AuthRequest, res) => {
     try {
-      const scopeCondition =
-        req.authUser!.role === 'factory_procurement' && req.authUser!.factoryId
-          ? and(
-              eq(reservations.recyclingStatus, 'verified_recycled'),
-              eq(reservations.factoryId, req.authUser!.factoryId)
-            )
-          : req.authUser!.role === 'generator_ops' && req.authUser!.hubId
-          ? and(
-              eq(reservations.recyclingStatus, 'verified_recycled'),
-              eq(reservations.hubId, req.authUser!.hubId)
-            )
-          : eq(reservations.recyclingStatus, 'verified_recycled');
+      const isAdmin = req.authUser!.role === 'platform_admin';
+      if (req.authUser!.role === 'factory_procurement' && !req.authUser!.factoryId) {
+        return res.status(403).json({ error: 'Forbidden: No recycling facility is linked to this account.' });
+      }
+      if (req.authUser!.role === 'generator_ops' && !req.authUser!.hubId) {
+        return res.status(403).json({ error: 'Forbidden: No Waste Generator facility is linked to this account.' });
+      }
+
+      const scopeCondition = isAdmin
+        ? eq(reservations.recyclingStatus, 'verified_recycled')
+        : req.authUser!.role === 'factory_procurement'
+        ? and(
+            eq(reservations.recyclingStatus, 'verified_recycled'),
+            eq(reservations.factoryId, req.authUser!.factoryId!)
+          )
+        : and(
+            eq(reservations.recyclingStatus, 'verified_recycled'),
+            eq(reservations.hubId, req.authUser!.hubId!)
+          );
 
       const [rows, factorMap] = await Promise.all([
         db
@@ -3564,21 +3930,6 @@ app.get(
   }
 );
 
-// Public liveness probe (fast, zero internal leakage)
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
-});
-
-// Readiness probe for Cloud Run / Kubernetes load balancers (verifies live PostgreSQL connectivity)
-app.get('/api/ready', async (_req, res) => {
-  try {
-    await db.execute(sql`SELECT 1`);
-    return res.json({ ready: true });
-  } catch {
-    return res.status(503).json({ ready: false });
-  }
-});
-
 // Centralized Express error handler (prevents leaking stack traces or Multer internals)
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   if (err?.message?.includes('Unsupported file type')) {
@@ -3596,19 +3947,18 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 // ============================================================================
 
 async function startServer() {
-  const PORT = Number(process.env.PORT) || 3000;
-  const isProd = process.env.NODE_ENV === 'production';
-
-  if (isProd && (!process.env.OURO_SESSION_SECRET || !process.env.OURO_FILE_SIGN_SECRET)) {
-    logStructured('warn', 'missing_production_signing_secrets', {
-      message:
-        'OURO_SESSION_SECRET and/or OURO_FILE_SIGN_SECRET are not explicitly configured in production environment.',
-    });
+  const envValidation = validateEnvironmentConfig(process.env, { throwOnProductionError: true });
+  for (const warn of envValidation.warnings) {
+    logStructured('warn', 'environment_config_warning', { message: warn });
   }
+  const { config } = bootstrapInfrastructure();
+  const PORT = config.http.port;
+  const isProd = config.isProduction;
 
   const httpServer = http.createServer(app);
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -3626,11 +3976,38 @@ async function startServer() {
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    logStructured('info', 'server_started', { port: PORT, mode: isProd ? 'production' : 'development' });
+    logStructured('info', 'server_started', {
+      port: PORT,
+      mode: isProd ? 'production' : 'development',
+      storageProvider: config.storage.provider,
+      cacheProvider: config.cache.provider,
+      emailProvider: config.email.provider,
+      jobsProvider: config.jobs.provider,
+    });
   });
+
+  // Graceful shutdown for Kubernetes / Cloud Run / ECS rolling deployments
+  let shuttingDown = false;
+  const gracefulShutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info('server_shutdown_signal_received', { signal });
+    httpServer.close(() => {
+      shutdownInfrastructure()
+        .catch((err) => logger.error('shutdown_infrastructure_error', { error: err }))
+        .finally(() => process.exit(0));
+    });
+    setTimeout(() => {
+      logger.warn('server_shutdown_forced_timeout', { signal });
+      process.exit(1);
+    }, 10_000).unref();
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start OURO server:', err);
+  logger.error('server_startup_failed', { error: err });
   process.exit(1);
 });

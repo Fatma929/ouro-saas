@@ -1,155 +1,88 @@
-import crypto from 'crypto';
-import fs from 'fs/promises';
-import path from 'path';
 import type { AuthenticatedUser } from '../middleware/auth.ts';
+import {
+  ALLOWED_MIME_TYPES,
+  VALID_FILE_PURPOSES,
+  validateFileMagicBytes,
+  signFileAccessToken,
+  verifyFileAccessToken,
+  getStorageProvider,
+  type SignedUrlParams,
+  type SignedUrlResult,
+  type StorageHealthResult,
+  type StorageObjectMetadata,
+} from '../infra/storage/index.ts';
 
-const STORAGE_ROOT = path.resolve(process.cwd(), 'storage', 'private');
-
-const FILE_SIGN_SECRET =
-  process.env.OURO_FILE_SIGN_SECRET && process.env.OURO_FILE_SIGN_SECRET.length >= 16
-    ? process.env.OURO_FILE_SIGN_SECRET
-    : process.env.OURO_SESSION_SECRET && process.env.OURO_SESSION_SECRET.length >= 16
-    ? process.env.OURO_SESSION_SECRET
-    : crypto.randomBytes(32).toString('hex');
-
-export const ALLOWED_MIME_TYPES = new Set([
-  'image/jpeg',
-  'image/png',
-  'image/webp',
-  'application/pdf',
-  'text/plain',
-]);
-
-export const VALID_FILE_PURPOSES = new Set([
-  'weighin_photo',
-  'kyc_document',
-  'supporting_doc',
-  'pod_document',
-  'weighbridge_ticket',
-  'recycling_evidence',
-]);
+export {
+  ALLOWED_MIME_TYPES,
+  VALID_FILE_PURPOSES,
+  validateFileMagicBytes,
+  signFileAccessToken,
+  verifyFileAccessToken,
+  getStorageProvider,
+};
 
 /**
- * Validates file magic bytes against declared MIME type to block spoofed uploads.
- */
-export function validateFileMagicBytes(buffer: Buffer, mimeType: string): boolean {
-  if (buffer.length === 0) return false;
-  if (mimeType === 'image/jpeg') {
-    return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
-  }
-  if (mimeType === 'image/png') {
-    return (
-      buffer.length >= 8 &&
-      buffer[0] === 0x89 &&
-      buffer[1] === 0x50 &&
-      buffer[2] === 0x4e &&
-      buffer[3] === 0x47
-    );
-  }
-  if (mimeType === 'image/webp') {
-    return (
-      buffer.length >= 12 &&
-      buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
-      buffer.subarray(8, 12).toString('ascii') === 'WEBP'
-    );
-  }
-  if (mimeType === 'application/pdf') {
-    return buffer.length >= 4 && buffer.subarray(0, 4).toString('ascii') === '%PDF';
-  }
-  if (mimeType === 'text/plain') {
-    // Reject binary null bytes in plain text files
-    return !buffer.includes(0x00);
-  }
-  return false;
-}
-
-function safeExtForMime(mimeType: string): string {
-  switch (mimeType) {
-    case 'image/jpeg':
-      return '.jpg';
-    case 'image/png':
-      return '.png';
-    case 'image/webp':
-      return '.webp';
-    case 'application/pdf':
-      return '.pdf';
-    default:
-      return '.txt';
-  }
-}
-
-/**
- * Stores file buffer in confined private disk storage and returns relative path + SHA-256 digest.
+ * Stores a validated file buffer via the configured ObjectStorageProvider (local, S3-compatible, or GCS)
+ * and returns its provider-independent storage key + SHA-256 digest.
  */
 export async function storePrivateFile(
   buffer: Buffer,
   purpose: string,
-  mimeType: string
-): Promise<{ storagePath: string; sha256: string }> {
-  const safePurpose = VALID_FILE_PURPOSES.has(purpose) ? purpose : 'supporting_doc';
-  const dir = path.resolve(STORAGE_ROOT, safePurpose);
-  if (!dir.startsWith(STORAGE_ROOT + path.sep)) {
-    throw new Error('INVALID_STORAGE_DIRECTORY');
-  }
-  await fs.mkdir(dir, { recursive: true });
-
-  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-  const filename = `${Date.now()}-${crypto.randomBytes(12).toString('hex')}${safeExtForMime(mimeType)}`;
-  const fullPath = path.resolve(dir, filename);
-  if (!fullPath.startsWith(STORAGE_ROOT + path.sep)) {
-    throw new Error('PATH_TRAVERSAL_BLOCKED');
-  }
-
-  await fs.writeFile(fullPath, buffer, { mode: 0o600 });
-  const relativePath = path.relative(STORAGE_ROOT, fullPath);
-  return { storagePath: relativePath, sha256 };
+  mimeType: string,
+  originalName?: string
+): Promise<{ storagePath: string; sha256: string; provider: string }> {
+  const provider = getStorageProvider();
+  const meta = await provider.upload({
+    buffer,
+    purpose,
+    mimeType,
+    originalName,
+  });
+  return {
+    storagePath: meta.key,
+    sha256: meta.sha256,
+    provider: meta.provider,
+  };
 }
 
 /**
- * Reads a file from private disk storage with strict directory confinement.
+ * Reads a file from the configured ObjectStorageProvider.
  */
 export async function readPrivateFile(storagePath: string): Promise<Buffer> {
-  const resolved = path.resolve(STORAGE_ROOT, storagePath);
-  if (!resolved.startsWith(STORAGE_ROOT + path.sep)) {
-    throw new Error('PATH_TRAVERSAL_BLOCKED');
-  }
-  return fs.readFile(resolved);
+  return getStorageProvider().download(storagePath);
 }
 
 /**
- * Issues a short-lived HMAC-signed access token (default 5 minutes) bound to a specific file ID and user.
+ * Deletes a file from the configured ObjectStorageProvider.
  */
-export function signFileAccessToken(fileId: number, userId: number, ttlSeconds = 300): string {
-  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
-  const payload = `${fileId}:${userId}:${exp}`;
-  const sig = crypto.createHmac('sha256', FILE_SIGN_SECRET).update(payload).digest('base64url');
-  return `${exp}.${userId}.${sig}`;
+export async function deletePrivateFile(storagePath: string): Promise<boolean> {
+  return getStorageProvider().delete(storagePath);
 }
 
-export function verifyFileAccessToken(fileId: number, token: string): { userId: number } | null {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [expStr, userIdStr, sig] = parts;
-  const exp = Number(expStr);
-  const userId = Number(userIdStr);
-  if (!Number.isFinite(exp) || !Number.isInteger(userId) || exp < Math.floor(Date.now() / 1000)) {
-    return null;
-  }
-  const payload = `${fileId}:${userId}:${exp}`;
-  const expectedSig = crypto
-    .createHmac('sha256', FILE_SIGN_SECRET)
-    .update(payload)
-    .digest('base64url');
-  const sigBuf = Buffer.from(sig);
-  const expectedBuf = Buffer.from(expectedSig);
-  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
-    return null;
-  }
-  return { userId };
+/**
+ * Retrieves object metadata from the configured ObjectStorageProvider.
+ */
+export async function getPrivateFileMetadata(storagePath: string): Promise<StorageObjectMetadata | null> {
+  return getStorageProvider().getMetadata(storagePath);
+}
+
+/**
+ * Generates a short-lived signed download URL (app-proxy HMAC or direct S3/GCS presigned URL depending on configuration).
+ */
+export async function getSignedFileDownloadUrl(params: SignedUrlParams): Promise<SignedUrlResult> {
+  return getStorageProvider().getSignedDownloadUrl(params);
+}
+
+/**
+ * Checks configured object storage provider health.
+ */
+export async function getStorageHealth(): Promise<StorageHealthResult> {
+  return getStorageProvider().healthCheck();
 }
 
 /**
  * Strict object-level authorization check for private documents.
+ * Preserved identically across local, S3-compatible, and GCS providers.
  */
 export function canUserAccessFile(
   user: AuthenticatedUser | null,
@@ -160,11 +93,11 @@ export function canUserAccessFile(
     ownerOrgId: number | null;
   }
 ): boolean {
+  if (!user) return false;
   // Weigh-in lot showcase photos are visible to authenticated B2B marketplace users
   if (file.purpose === 'weighin_photo') {
     return true;
   }
-  if (!user) return false;
   if (user.role === 'platform_admin') return true;
   if (file.uploadedByUid && file.uploadedByUid === user.uid) return true;
 
@@ -182,3 +115,4 @@ export function canUserAccessFile(
   }
   return false;
 }
+

@@ -1,6 +1,9 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import { notifications, users } from '../db/schema.ts';
+import { getEmailProvider, type EmailProviderStatus } from '../infra/email/index.ts';
+import { getJobQueue } from '../infra/jobs/index.ts';
+import { logger } from '../infra/logger.ts';
 import type { UserRole } from '../shared/constants.ts';
 
 export interface NotificationInput {
@@ -16,37 +19,15 @@ export interface NotificationInput {
 }
 
 /**
- * Honest email provider configuration status.
- * Never fabricates email delivery unless real SMTP/Resend credentials exist in server env.
+ * Honest email provider configuration status delegated to the cloud-agnostic EmailProvider.
  */
-export function getEmailProviderStatus(): {
-  configured: boolean;
-  provider: 'resend' | 'smtp' | 'none';
-  note: string;
-} {
-  if (process.env.RESEND_API_KEY) {
-    return {
-      configured: true,
-      provider: 'resend',
-      note: 'Resend API key detected; transactional email dispatch enabled.',
-    };
-  }
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    return {
-      configured: true,
-      provider: 'smtp',
-      note: `SMTP relay configured (${process.env.SMTP_HOST}).`,
-    };
-  }
-  return {
-    configured: false,
-    provider: 'none',
-    note: 'In-app notifications active. External email delivery is unconfigured (set RESEND_API_KEY or SMTP_HOST/USER/PASS in server secrets to enable).',
-  };
+export function getEmailProviderStatus(): EmailProviderStatus {
+  return getEmailProvider().getStatus();
 }
 
 /**
- * Creates a persistent in-app notification row in PostgreSQL.
+ * Creates a persistent in-app notification row in PostgreSQL and, if an external email provider
+ * is configured, enqueues a non-blocking transactional email job via the cloud-agnostic JobQueue.
  */
 export async function dispatchNotification(input: NotificationInput, txOrDb: any = db) {
   try {
@@ -62,8 +43,26 @@ export async function dispatchNotification(input: NotificationInput, txOrDb: any
       entityId: input.entityId ?? null,
       isRead: false,
     });
+
+    const emailStatus = getEmailProvider().getStatus();
+    if (emailStatus.configured && input.userId) {
+      const recipientRows = await db
+        .select({ email: users.email, language: users.language })
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .limit(1);
+      const recipient = recipientRows[0];
+      if (recipient?.email) {
+        const useAr = recipient.language === 'ar';
+        await getJobQueue().enqueue('email.send', {
+          to: recipient.email,
+          subject: `[OURO] ${useAr ? input.titleAr : input.titleEn}`,
+          text: `${useAr ? input.messageAr : input.messageEn}\n\n— OURO Digital Waste Management Platform`,
+        });
+      }
+    }
   } catch (err) {
-    console.error('Notification dispatch failed (non-blocking):', err);
+    logger.error('notification_dispatch_failed', { error: err, type: input.type });
   }
 }
 
@@ -98,6 +97,7 @@ export async function notifyOrganization(
       await dispatchNotification({ ...payload, userId: u.id }, txOrDb);
     }
   } catch (err) {
-    console.error('Organization notification dispatch failed (non-blocking):', err);
+    logger.error('organization_notification_dispatch_failed', { error: err, org });
   }
 }
+
