@@ -14,6 +14,7 @@ import { AdminCommandDashboard } from './components/AdminCommandDashboard.tsx';
 import { PassportModal } from './components/PassportModal.tsx';
 import { PassportQRScanner } from './components/PassportQRScanner.tsx';
 import { EsgCertificateModal } from './components/EsgCertificateModal.tsx';
+import { NotificationBell } from './components/NotificationBell.tsx';
 import { PWAInstallButton, OfflineIndicator } from './components/PWAInstallButton.tsx';
 import { TRANSLATIONS, type Lang } from './shared/i18n.ts';
 import type { UserRole } from './shared/constants.ts';
@@ -180,7 +181,7 @@ export default function App() {
                 )}
               </nav>
 
-              {/* Zone 3: Quick Passport Lookup + Language + Sign Out */}
+              {/* Zone 3: Quick Passport Lookup + Notifications + Language + Sign Out */}
               <div className="flex items-center gap-2 shrink-0">
                 <form onSubmit={handlePassportLookup} className="hidden lg:flex items-center relative">
                   <Search className="w-3.5 h-3.5 text-[#9EA3A4] absolute left-2.5 pointer-events-none" />
@@ -202,6 +203,8 @@ export default function App() {
                   <ScanLine className="w-3.5 h-3.5 text-[#C4A87E]" />
                   <span className="hidden sm:inline">{lang === 'ar' ? 'مسح QR' : 'Scan QR'}</span>
                 </button>
+
+                <NotificationBell lang={lang} onInspectPassport={setInspectPassportCode} />
 
                 <PWAInstallButton variant="dark" />
 

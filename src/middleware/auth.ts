@@ -63,50 +63,25 @@ async function syncFirebaseUser(uid: string, email: string, name?: string) {
   return inserted[0];
 }
 
-export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
+export async function resolveUserFromBearer(authHeader?: string): Promise<AuthenticatedUser | null> {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: Missing authentication token' });
+    return null;
   }
-
   const token = authHeader.slice('Bearer '.length).trim();
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized: Empty token' });
-  }
+  if (!token) return null;
 
-  try {
-    // 1. Check signed OURO session token (from Email / Worker ID / Driver ID + Password login)
-    if (token.startsWith('ouro.')) {
-      const payload = verifySessionToken(token);
-      if (!payload) {
-        return res.status(401).json({ error: 'Unauthorized: Session expired or invalid' });
-      }
-      const rows = await db.select().from(users).where(eq(users.id, payload.userId)).limit(1);
-      if (rows.length === 0) {
-        return res.status(401).json({ error: 'Unauthorized: Account not found' });
-      }
-      const u = rows[0];
-      req.authUser = {
-        id: u.id,
-        uid: u.uid,
-        email: u.email,
-        fullName: u.fullName,
-        phone: u.phone,
-        accountCode: u.accountCode,
-        role: u.role as UserRole,
-        hubId: u.hubId,
-        factoryId: u.factoryId,
-        logisticsProviderId: u.logisticsProviderId,
-        language: u.language,
-      };
-      return next();
+  if (token.startsWith('ouro.')) {
+    const payload = verifySessionToken(token);
+    if (!payload) return null;
+    const rows = await db.select().from(users).where(eq(users.id, payload.userId)).limit(1);
+    if (rows.length === 0) return null;
+    const u = rows[0];
+    if (!u.isActive) {
+      throw Object.assign(new Error('Account has been deactivated by platform administration.'), {
+        statusCode: 403,
+      });
     }
-
-    // 2. Verify Firebase Auth ID Token (Google Sign-In)
-    const decoded = await adminAuth.verifyIdToken(token);
-    const email = (decoded.email || `${decoded.uid}@ouro.eco`).toLowerCase();
-    const u = await syncFirebaseUser(decoded.uid, email, decoded.name);
-    req.authUser = {
+    return {
       id: u.id,
       uid: u.uid,
       email: u.email,
@@ -119,8 +94,48 @@ export const requireAuth = async (req: AuthRequest, res: Response, next: NextFun
       logisticsProviderId: u.logisticsProviderId,
       language: u.language,
     };
+  }
+
+  const decoded = await adminAuth.verifyIdToken(token);
+  const email = (decoded.email || `${decoded.uid}@ouro.eco`).toLowerCase();
+  const u = await syncFirebaseUser(decoded.uid, email, decoded.name);
+  if (!u.isActive) {
+    throw Object.assign(new Error('Account has been deactivated by platform administration.'), {
+      statusCode: 403,
+    });
+  }
+  return {
+    id: u.id,
+    uid: u.uid,
+    email: u.email,
+    fullName: u.fullName,
+    phone: u.phone,
+    accountCode: u.accountCode,
+    role: u.role as UserRole,
+    hubId: u.hubId,
+    factoryId: u.factoryId,
+    logisticsProviderId: u.logisticsProviderId,
+    language: u.language,
+  };
+}
+
+export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized: Missing authentication token' });
+  }
+
+  try {
+    const user = await resolveUserFromBearer(authHeader);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized: Session expired or invalid' });
+    }
+    req.authUser = user;
     return next();
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.statusCode === 403) {
+      return res.status(403).json({ error: error.message });
+    }
     console.error('Authentication verification failed:', error);
     return res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }

@@ -17,18 +17,28 @@ import {
   X,
   Leaf,
   FileCheck,
+  FileText,
+  Download,
+  Pencil,
+  Trash2,
+  Truck,
+  Flag,
 } from 'lucide-react';
-import { apiFetch } from '../lib/api.ts';
+import { apiFetch, downloadAuthenticatedCsv } from '../lib/api.ts';
 import { buildPassportQrUrl } from '../lib/passport-qr.ts';
 import { PassportQRCode } from './PassportQRCode.tsx';
+import { LifecycleBadge } from './ui/DesignSystem.tsx';
+import { DisputeModal } from './DisputeModal.tsx';
 import { useOnlineStatus } from '../hooks/usePWA.ts';
 import {
   MATERIAL_METADATA,
   FACILITY_TYPE_LABELS,
+  PICKUP_STATUS_LABELS,
   type MaterialCategory,
   type PurityGrade,
   type VerificationMethod,
   type FacilityType,
+  type PickupStatus,
 } from '../shared/constants.ts';
 import { TRANSLATIONS, type Lang } from '../shared/i18n.ts';
 
@@ -59,19 +69,15 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
   const [hubs, setHubs] = useState<any[]>([]);
   const [selectedHubId, setSelectedHubId] = useState<number | null>(user.hubId || null);
   const [recentPassports, setRecentPassports] = useState<any[]>([]);
-  const [facilityEsg, setFacilityEsg] = useState<{
-    totalDivertedTons: number;
-    deliveredTons: number;
-    verifiedCo2eTons: number;
-    projectedCo2eTons: number;
-    sealedPassportsCount: number;
-    activePassportsCount: number;
-  }>({
-    totalDivertedTons: 0,
+  const [incomingReservations, setIncomingReservations] = useState<any[]>([]);
+  const [facilityEsg, setFacilityEsg] = useState({
+    listedTons: 0,
     deliveredTons: 0,
+    verifiedRecycledTons: 0,
     verifiedCo2eTons: 0,
-    projectedCo2eTons: 0,
+    estimatedCo2eTons: 0,
     sealedPassportsCount: 0,
+    deliveredPendingCount: 0,
     activePassportsCount: 0,
   });
   const [loadingWorkspace, setLoadingWorkspace] = useState(true);
@@ -95,11 +101,28 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
     MATERIAL_METADATA.paper_cardboard.defaultRateEgp
   );
   const [pickupWindow, setPickupWindow] = useState('Tomorrow 08:00 - 13:00 EET');
+  const [notes, setNotes] = useState('');
 
-  // Photo Upload State
+  // Photo & Supporting Doc Upload State
   const [photoPreviewUrl, setPhotoPreviewUrl] = useState<string | null>(null);
   const [uploadedPhotoId, setUploadedPhotoId] = useState<number | null>(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [supportingDocId, setSupportingDocId] = useState<number | null>(null);
+  const [supportingDocName, setSupportingDocName] = useState<string | null>(null);
+  const [uploadingDoc, setUploadingDoc] = useState(false);
+
+  // Edit / Cancel / Dispute Modal State
+  const [editingLot, setEditingLot] = useState<any | null>(null);
+  const [editPrice, setEditPrice] = useState<number>(0);
+  const [editGrade, setEditGrade] = useState<PurityGrade>('Grade A');
+  const [editWindow, setEditWindow] = useState('');
+  const [editNotes, setEditNotes] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [disputeTarget, setDisputeTarget] = useState<{
+    reservationId?: number;
+    passportId?: number;
+    label: string;
+  } | null>(null);
 
   // Submission & Offline Queue
   const [submitting, setSubmitting] = useState(false);
@@ -118,12 +141,14 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
   const loadWorkspace = useCallback(async () => {
     setLoadingWorkspace(true);
     try {
-      const data = await apiFetch('/api/worker/workspace');
+      const qs = selectedHubId && user.role === 'platform_admin' ? `?hubId=${selectedHubId}` : '';
+      const data = await apiFetch(`/api/worker/workspace${qs}`);
       setHubs(data.hubs || []);
       if (data.assignedHub && !selectedHubId) {
         setSelectedHubId(data.assignedHub.id);
       }
       setRecentPassports(data.recentPassports || []);
+      setIncomingReservations(data.incomingReservations || []);
       if (data.facilityEsg) {
         setFacilityEsg(data.facilityEsg);
       }
@@ -132,13 +157,12 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
     } finally {
       setLoadingWorkspace(false);
     }
-  }, [selectedHubId]);
+  }, [selectedHubId, user.role]);
 
   useEffect(() => {
     loadWorkspace();
   }, [loadWorkspace]);
 
-  // Persist offline queue safely (contains only unsent weigh-in lots, never auth tokens)
   useEffect(() => {
     try {
       localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(offlineQueue));
@@ -147,7 +171,6 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
     }
   }, [offlineQueue]);
 
-  // Auto-sync queued offline submissions when back online
   const syncOfflineQueue = useCallback(async () => {
     if (!isOnline || offlineQueue.length === 0) return;
     setSyncingQueue(true);
@@ -234,9 +257,7 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
           }
         });
       } catch {
-        setBleStatusNote(
-          `Paired with ${device.name || 'BLE Scale'}. Ready to capture GATT scale readings.`
-        );
+        setBleStatusNote(`Paired with ${device.name || 'BLE Scale'}. Ready to capture GATT readings.`);
       }
 
       device.addEventListener('gattserverdisconnected', () => {
@@ -272,16 +293,12 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
     if (!file) return;
     setUploadingPhoto(true);
     setMessage(null);
-
     try {
-      const localUrl = URL.createObjectURL(file);
-      setPhotoPreviewUrl(localUrl);
-
+      setPhotoPreviewUrl(URL.createObjectURL(file));
       const formData = new FormData();
       formData.append('file', file);
       formData.append('purpose', 'weighin_photo');
-
-      const uploaded = await apiFetch<{ id: number; url: string }>('/api/storage/upload', {
+      const uploaded = await apiFetch<{ id: number }>('/api/storage/upload', {
         method: 'POST',
         body: formData,
       });
@@ -290,6 +307,28 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
       setMessage({ type: 'error', text: err.message || 'Photo upload failed.' });
     } finally {
       setUploadingPhoto(false);
+    }
+  };
+
+  const handleSupportingDocUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingDoc(true);
+    setMessage(null);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('purpose', 'supporting_doc');
+      const uploaded = await apiFetch<{ id: number; originalName: string }>('/api/storage/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      setSupportingDocId(uploaded.id);
+      setSupportingDocName(uploaded.originalName);
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err.message || 'Supporting document upload failed.' });
+    } finally {
+      setUploadingDoc(false);
     }
   };
 
@@ -313,6 +352,9 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
       pricePerTonEgp,
       verificationMethod,
       photoFileId: uploadedPhotoId,
+      supportingDocFileId: supportingDocId,
+      supportingDocName,
+      notes,
       pickupWindow,
       gpsLat: activeHub.lat,
       gpsLng: activeHub.lng,
@@ -343,12 +385,15 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
       });
       setMessage({
         type: 'success',
-        text: `Minted Digital Waste Passport ${res.passport.passportCode} (${netWeightTons.toFixed(2)} tons listed at Stage 3). Scannable QR Bale Tag generated below.`,
+        text: `Minted Digital Waste Passport ${res.passport.passportCode} (${netWeightTons.toFixed(2)} tons — Status: LISTED). Scannable QR Bale Tag generated below.`,
       });
       setWeightLocked(false);
       setTareOffsetKg(0);
       setUploadedPhotoId(null);
       setPhotoPreviewUrl(null);
+      setSupportingDocId(null);
+      setSupportingDocName(null);
+      setNotes('');
       await loadWorkspace();
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message || 'Could not publish lot.' });
@@ -357,9 +402,62 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
     }
   };
 
+  const openEditModal = (lot: any) => {
+    setEditingLot(lot);
+    setEditPrice(lot.pricePerTonEgp);
+    setEditGrade(lot.purityGrade as PurityGrade);
+    setEditWindow(lot.pickupWindow);
+    setEditNotes(lot.notes || '');
+  };
+
+  const handleSaveEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingLot) return;
+    setSavingEdit(true);
+    try {
+      await apiFetch(`/api/passports/${editingLot.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          pricePerTonEgp: editPrice,
+          purityGrade: editGrade,
+          pickupWindow: editWindow,
+          notes: editNotes,
+        }),
+      });
+      setMessage({ type: 'success', text: `Updated listing ${editingLot.passportCode}.` });
+      setEditingLot(null);
+      await loadWorkspace();
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err.message || 'Failed to update listing.' });
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const handleCancelLot = async (lot: any) => {
+    try {
+      await apiFetch(`/api/passports/${lot.id}`, { method: 'DELETE' });
+      setMessage({ type: 'success', text: `Cancelled unreserved listing ${lot.passportCode}.` });
+      await loadWorkspace();
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err.message || 'Failed to cancel listing.' });
+    }
+  };
+
+  const handleExportGeneratorCsv = async () => {
+    try {
+      await downloadAuthenticatedCsv(
+        '/api/generator/transactions.csv',
+        `OURO_Generator_Waste_Ledger_${new Date().toISOString().slice(0, 10)}.csv`
+      );
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err.message || 'CSV export failed.' });
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
-      {/* Waste Generator Facility Assignment & Storage Occupancy Bar */}
+      {/* Waste Generator Facility Header & Storage Occupancy Bar */}
       <div className="rounded-2xl bg-white border border-slate-200 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="space-y-1">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
@@ -375,13 +473,26 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
             <span aria-hidden="true">·</span>
             <span>{activeHub?.governorate}</span>
           </div>
-          <h1 className="text-xl sm:text-2xl font-extrabold text-[#272F31]">
-            {t.worker.title}
-          </h1>
+          <h1 className="text-xl sm:text-2xl font-extrabold text-[#272F31]">{t.worker.title}</h1>
           {activeHub && (
             <p className="text-sm text-slate-600">
               {lang === 'ar' ? activeHub.nameAr : activeHub.nameEn} — {activeHub.address}
             </p>
+          )}
+          {user.role === 'platform_admin' && hubs.length > 1 && (
+            <div className="pt-1">
+              <select
+                value={selectedHubId || ''}
+                onChange={(e) => setSelectedHubId(Number(e.target.value))}
+                className="rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-[#272F31]"
+              >
+                {hubs.map((h) => (
+                  <option key={h.id} value={h.id}>
+                    {h.code} — {h.nameEn}
+                  </option>
+                ))}
+              </select>
+            </div>
           )}
         </div>
 
@@ -416,54 +527,67 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
         )}
       </div>
 
-      {/* Facility ESG Carbon Impact Dashboard */}
+      {/* Facility ESG Impact Banner — Strictly Separating LISTED / DELIVERED / VERIFIED RECYCLED */}
       <section className="rounded-2xl bg-[#272F31] text-white p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-        <div className="space-y-1">
+        <div className="space-y-1 flex-1">
           <p className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
             <Leaf className="w-3.5 h-3.5" />
             <span>
               {lang === 'ar'
-                ? 'لوحة الأثر البيئي الكربوني للمنشأة (ESG)'
-                : 'Facility ESG Carbon Impact Dashboard'}
+                ? 'لوحة تتبع المخلفات والأثر البيئي المعتمد للمنشأة (ESG)'
+                : 'Facility Circular Ledger — Listed vs. Delivered vs. Verified Recycled'}
             </span>
           </p>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-5 pt-2">
             <div>
-              <p className="text-[11px] text-slate-300">Total Diverted</p>
+              <p className="text-[11px] text-slate-300">Listed Tonnage</p>
               <p className="text-xl font-extrabold font-mono tabular-nums text-white">
-                {facilityEsg.totalDivertedTons.toFixed(2)} t
+                {facilityEsg.listedTons.toFixed(2)} t
               </p>
             </div>
             <div>
-              <p className="text-[11px] text-slate-300">Verified CO2e Avoided</p>
+              <p className="text-[11px] text-amber-200">Delivered (Pending Proof)</p>
+              <p className="text-xl font-extrabold font-mono tabular-nums text-amber-300">
+                {facilityEsg.deliveredTons.toFixed(2)} t
+              </p>
+            </div>
+            <div>
+              <p className="text-[11px] text-emerald-200">Verified Recycled Output</p>
               <p className="text-xl font-extrabold font-mono tabular-nums text-emerald-400">
+                {facilityEsg.verifiedRecycledTons.toFixed(2)} t
+              </p>
+            </div>
+            <div>
+              <p className="text-[11px] text-emerald-200">Verified Net CO2e</p>
+              <p className="text-xl font-extrabold font-mono tabular-nums text-emerald-300">
                 {facilityEsg.verifiedCo2eTons.toFixed(2)} tCO2e
               </p>
-            </div>
-            <div>
-              <p className="text-[11px] text-slate-300">Projected Carbon Value</p>
-              <p className="text-xl font-extrabold font-mono tabular-nums text-emerald-200">
-                {facilityEsg.projectedCo2eTons.toFixed(2)} tCO2e
-              </p>
-            </div>
-            <div>
-              <p className="text-[11px] text-slate-300">Active / Sealed Passports</p>
-              <p className="text-xl font-extrabold font-mono tabular-nums text-white">
-                {facilityEsg.activePassportsCount} / {facilityEsg.sealedPassportsCount}
+              <p className="text-[10px] text-slate-400 font-mono">
+                Est. unverified: {facilityEsg.estimatedCo2eTons.toFixed(1)} t
               </p>
             </div>
           </div>
         </div>
-        {onOpenEsgCertificate && (
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           <button
             type="button"
-            onClick={onOpenEsgCertificate}
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2.5 text-xs font-bold text-white transition-colors whitespace-nowrap min-h-[42px] shrink-0"
+            onClick={handleExportGeneratorCsv}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-white/10 hover:bg-white/20 px-3.5 py-2.5 text-xs font-bold text-white transition-colors whitespace-nowrap min-h-[42px]"
           >
-            <FileCheck className="w-4 h-4" />
-            <span>{lang === 'ar' ? 'شهادة ESG للمنشأة' : 'Facility ESG Certificate'}</span>
+            <Download className="w-4 h-4 text-[#C4A87E]" />
+            <span>Export CSV</span>
           </button>
-        )}
+          {onOpenEsgCertificate && (
+            <button
+              type="button"
+              onClick={onOpenEsgCertificate}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2.5 text-xs font-bold text-white transition-colors whitespace-nowrap min-h-[42px]"
+            >
+              <FileCheck className="w-4 h-4" />
+              <span>{lang === 'ar' ? 'شهادة ESG للمنشأة' : 'Facility ESG Certificate'}</span>
+            </button>
+          )}
+        </div>
       </section>
 
       {/* Offline Queue Banner */}
@@ -489,18 +613,23 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
 
       {message && (
         <div
-          className={`rounded-xl border px-4 py-3 text-sm font-medium flex items-center gap-2 ${
+          className={`rounded-xl border px-4 py-3 text-sm font-medium flex items-center justify-between gap-2 ${
             message.type === 'success'
               ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
               : 'border-red-200 bg-red-50 text-red-800'
           }`}
         >
-          {message.type === 'success' ? (
-            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-          ) : (
-            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
-          )}
-          <span>{message.text}</span>
+          <div className="flex items-center gap-2">
+            {message.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            )}
+            <span>{message.text}</span>
+          </div>
+          <button type="button" onClick={() => setMessage(null)}>
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -568,7 +697,7 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
         </section>
       )}
 
-      {/* Main 2-Column Responsive Field Intake + Recent Minted Passports */}
+      {/* Main 2-Column Field Intake + Facility Passports & Incoming Shipments */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Left: Digital Scale Instrument & Intake Form */}
         <form
@@ -609,8 +738,7 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
               )}
             </div>
 
-            {/* Monospace Numeric Weight Display */}
-            <div className="rounded-lg bg-[#08172C] border border-white/10 px-5 py-4 flex flex-wrap items-baseline justify-between gap-4">
+            <div className="rounded-lg bg-[#1C2325] border border-white/10 px-5 py-4 flex flex-wrap items-baseline justify-between gap-4">
               <div>
                 <p className="text-[11px] font-mono text-slate-400">NET VERIFIED WEIGHT</p>
                 <div className="flex items-baseline gap-2 mt-1">
@@ -631,7 +759,6 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
               </div>
             </div>
 
-            {/* Scale Controls (Touch Targets >= 44px) */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
               <button
                 type="button"
@@ -664,7 +791,6 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
               </button>
             </div>
 
-            {/* Calibrated Manual Input */}
             <div className="pt-2 border-t border-white/10">
               <label className="block text-xs font-medium text-slate-300 mb-1.5">
                 Calibrated Gross Weight Input (kg) — Auto-tagged as{' '}
@@ -689,7 +815,7 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
             </div>
           </div>
 
-          {/* Sorting Classification & Pricing */}
+          {/* Sorting Classification, Pricing & Notes */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1.5">
@@ -772,15 +898,28 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
                 className="w-full min-h-[44px] rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-[#272F31] focus:border-emerald-600 focus:outline-none"
               />
             </div>
+
+            <div className="sm:col-span-2">
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                Handling / Baling Notes (Optional)
+              </label>
+              <input
+                type="text"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="e.g., Forklift available at Dock B, moisture < 8%, 12 compressed bales"
+                className="w-full min-h-[42px] rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-[#272F31] focus:border-emerald-600 focus:outline-none"
+              />
+            </div>
           </div>
 
-          {/* Mobile Camera Photo Evidence Capture -> Cloud Storage */}
-          <div className="space-y-2">
-            <label className="block text-xs font-semibold text-slate-700">
-              {t.worker.capturePhoto} (Uploaded to Cloud Object Storage)
-            </label>
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
-              <label className="flex-1 min-h-[52px] flex items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-[#F8FAFC] hover:bg-slate-100 px-4 py-3 cursor-pointer text-sm font-semibold text-[#272F31] transition-colors">
+          {/* Photo & Supporting Compliance Document Capture */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-slate-700">
+                {t.worker.capturePhoto}
+              </label>
+              <label className="min-h-[48px] flex items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-[#F8FAFC] hover:bg-slate-100 px-3 py-2.5 cursor-pointer text-xs font-semibold text-[#272F31]">
                 {uploadingPhoto ? (
                   <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
                 ) : (
@@ -788,10 +927,10 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
                 )}
                 <span>
                   {uploadingPhoto
-                    ? 'Uploading to Cloud Storage...'
+                    ? 'Uploading...'
                     : uploadedPhotoId
-                    ? 'Photo Stored — Tap to Retake'
-                    : 'Capture / Upload Lot Photo'}
+                    ? 'Photo Stored ✓'
+                    : 'Capture / Upload Photo'}
                 </span>
                 <input
                   type="file"
@@ -801,24 +940,46 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
                   className="hidden"
                 />
               </label>
-
               {photoPreviewUrl && (
-                <div className="w-24 h-16 rounded-lg overflow-hidden border border-slate-200 shrink-0">
-                  <img
-                    src={photoPreviewUrl}
-                    alt="Captured recyclable lot preview"
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover"
-                  />
-                </div>
+                <img
+                  src={photoPreviewUrl}
+                  alt="Lot preview"
+                  referrerPolicy="no-referrer"
+                  className="w-24 h-14 object-cover rounded-lg border border-slate-200"
+                />
               )}
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-slate-700">
+                Supporting Manifest / Spec PDF (Optional)
+              </label>
+              <label className="min-h-[48px] flex items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-[#F8FAFC] hover:bg-slate-100 px-3 py-2.5 cursor-pointer text-xs font-semibold text-[#272F31]">
+                {uploadingDoc ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+                ) : (
+                  <FileText className="w-4 h-4 text-amber-700" />
+                )}
+                <span className="truncate max-w-[180px]">
+                  {uploadingDoc
+                    ? 'Validating...'
+                    : supportingDocName
+                    ? supportingDocName
+                    : 'Attach PDF / Text Manifest'}
+                </span>
+                <input
+                  type="file"
+                  accept=".pdf,.txt,image/*"
+                  onChange={handleSupportingDocUpload}
+                  className="hidden"
+                />
+              </label>
             </div>
           </div>
 
-          {/* Primary Publish & Mint CTA */}
           <button
             type="submit"
-            disabled={submitting || uploadingPhoto}
+            disabled={submitting || uploadingPhoto || uploadingDoc}
             className="w-full min-h-[52px] inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-base shadow-sm transition-colors disabled:opacity-60"
           >
             {submitting ? (
@@ -832,70 +993,257 @@ export const HubWorkerWorkspace: React.FC<HubWorkerWorkspaceProps> = ({
           </button>
         </form>
 
-        {/* Right: Recently Minted Passports at this Facility */}
-        <div className="lg:col-span-5 rounded-2xl bg-white border border-slate-200 p-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-base font-bold text-[#272F31]">
-                Facility Digital Waste Passports
-              </h2>
-              <p className="text-xs text-slate-500">
-                Tap any lot to open its scannable QR code & 7-stage custody trail
-              </p>
+        {/* Right Column: Facility Passports (with Edit/Cancel) + Incoming Reservations */}
+        <div className="lg:col-span-5 space-y-6">
+          {/* Facility Passports */}
+          <div className="rounded-2xl bg-white border border-slate-200 p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-bold text-[#272F31]">Facility Digital Waste Passports</h2>
+                <p className="text-xs text-slate-500">
+                  Manage active listings, inspect QR custody trails & mass balance
+                </p>
+              </div>
+              <span className="font-mono text-xs font-semibold text-slate-500">
+                {recentPassports.length} lots
+              </span>
             </div>
-            <span className="font-mono text-xs font-semibold text-slate-500">
-              {recentPassports.length} lots
-            </span>
+
+            {loadingWorkspace ? (
+              <div className="py-10 flex justify-center text-slate-400">
+                <Loader2 className="w-5 h-5 animate-spin" />
+              </div>
+            ) : recentPassports.length === 0 ? (
+              <p className="py-10 text-center text-sm text-slate-500">
+                No lots published from this facility yet.
+              </p>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {recentPassports.map((p) => {
+                  const canEdit = p.status !== 'cancelled' && p.lifecycleStatus !== 'RECYCLED';
+                  const canCancel =
+                    p.status !== 'cancelled' &&
+                    p.reservedTons === 0 &&
+                    p.deliveredTons === 0 &&
+                    p.recycledTons === 0;
+
+                  return (
+                    <div key={p.id} className="py-3.5 flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                          <button
+                            type="button"
+                            onClick={() => onInspectPassport(p.passportCode)}
+                            className="font-mono font-bold text-emerald-700 hover:underline"
+                          >
+                            {p.passportCode}
+                          </button>
+                          <LifecycleBadge status={p.lifecycleStatus} lang={lang} />
+                          {p.status === 'cancelled' && (
+                            <span className="text-[10px] font-bold uppercase text-red-600">CANCELLED</span>
+                          )}
+                        </div>
+                        <p className="text-sm font-semibold text-[#272F31] truncate">
+                          {p.materialSubtype} ({p.purityGrade})
+                        </p>
+                        <p className="text-xs text-slate-500 font-mono tabular-nums">
+                          Avail: {p.availableTons.toFixed(2)} t · Res: {p.reservedTons.toFixed(2)} t ·
+                          Deliv: {p.deliveredTons.toFixed(2)} t · Recyc: {p.recycledTons.toFixed(2)} t
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          {canEdit && (
+                            <button
+                              type="button"
+                              onClick={() => openEditModal(p)}
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-600 hover:text-[#272F31]"
+                            >
+                              <Pencil className="w-3 h-3" />
+                              <span>Edit</span>
+                            </button>
+                          )}
+                          {canCancel && (
+                            <button
+                              type="button"
+                              onClick={() => handleCancelLot(p)}
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-red-600 hover:text-red-800"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                              <span>Cancel</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onInspectPassport(p.passportCode)}
+                        className="shrink-0 bg-white p-1 rounded-lg border border-slate-200 hover:border-emerald-600"
+                        title="Open Passport QR"
+                      >
+                        <QRCodeSVG
+                          value={buildPassportQrUrl(p.passportCode)}
+                          size={44}
+                          fgColor="#272F31"
+                          bgColor="#FFFFFF"
+                          level="M"
+                        />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
-          {loadingWorkspace ? (
-            <div className="py-10 flex justify-center text-slate-400">
-              <Loader2 className="w-5 h-5 animate-spin" />
+          {/* Incoming Factory Reservations & 3PL Pickup Status */}
+          <div className="rounded-2xl bg-white border border-slate-200 p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-bold text-[#272F31] flex items-center gap-1.5">
+                <Truck className="w-4 h-4 text-emerald-600" />
+                <span>Incoming Reservations & 3PL Pickups</span>
+              </h2>
+              <span className="font-mono text-xs text-slate-500">{incomingReservations.length}</span>
             </div>
-          ) : recentPassports.length === 0 ? (
-            <p className="py-10 text-center text-sm text-slate-500">
-              No lots published from this facility yet. Record your first weigh-in on the left.
-            </p>
-          ) : (
-            <div className="divide-y divide-slate-100">
-              {recentPassports.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => onInspectPassport(p.passportCode)}
-                  className="w-full text-left py-3.5 px-2 -mx-2 rounded-lg hover:bg-slate-50 transition-colors flex items-center justify-between gap-3 min-h-[60px]"
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-1.5 text-xs">
-                      <span className="font-mono font-bold text-emerald-700">{p.passportCode}</span>
-                      <span className="text-slate-400">·</span>
-                      <span className="text-slate-600">{p.purityGrade}</span>
-                      <span className="text-slate-400">·</span>
-                      <span className="text-slate-500">Stage {p.currentStage}/7</span>
+
+            {incomingReservations.length === 0 ? (
+              <p className="text-xs text-slate-500 py-4 text-center">
+                No factory reservations yet for this facility.
+              </p>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {incomingReservations.slice(0, 8).map((r) => (
+                  <div key={r.id} className="py-3 space-y-1 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono font-bold text-[#272F31]">{r.reservationCode}</span>
+                      <span className="font-semibold text-emerald-700 capitalize">
+                        {PICKUP_STATUS_LABELS[r.pickupStatus as PickupStatus]?.[lang] || r.pickupStatus}
+                      </span>
                     </div>
-                    <p className="text-sm font-semibold text-[#272F31] truncate mt-0.5">
-                      {p.materialSubtype}
+                    <p className="text-slate-700">
+                      Buyer: <strong>{r.factoryNameEn}</strong> · {r.quantityTons.toFixed(2)} t
                     </p>
-                    <p className="text-xs text-slate-500 font-mono tabular-nums mt-0.5">
-                      Avail: {p.availableTons.toFixed(2)} t · Res: {p.reservedTons.toFixed(2)} t ·{' '}
-                      {p.verificationMethod}
+                    <p className="text-slate-500">
+                      3PL: {r.providerNameEn} ({r.providerLicenseId})
                     </p>
+                    <div className="flex items-center justify-between pt-1">
+                      <span className="font-mono text-[11px] text-slate-600">
+                        {r.recyclingStatus === 'verified_recycled'
+                          ? `Verified Recycled: ${r.recoveredTons} t (+${r.co2eAvoidedTons} tCO2e)`
+                          : r.pickupStatus === 'delivered'
+                          ? 'Delivered — Awaiting Recycler Verification'
+                          : r.pickupWindow}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setDisputeTarget({
+                            reservationId: r.id,
+                            passportId: r.passportId,
+                            label: `${r.reservationCode} / ${r.passportCode}`,
+                          })
+                        }
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 hover:underline"
+                      >
+                        <Flag className="w-3 h-3" />
+                        <span>Report Issue</span>
+                      </button>
+                    </div>
                   </div>
-                  <div className="shrink-0 bg-white p-1 rounded-lg border border-slate-200 shadow-2xs">
-                    <QRCodeSVG
-                      value={buildPassportQrUrl(p.passportCode)}
-                      size={44}
-                      fgColor="#272F31"
-                      bgColor="#FFFFFF"
-                      level="M"
-                    />
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
+
+      {/* Edit Listing Modal */}
+      {editingLot && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#272F31]/65 p-4" role="dialog" aria-modal="true">
+          <form
+            onSubmit={handleSaveEdit}
+            className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl border border-slate-200 space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-bold text-[#272F31]">
+                Edit Listing {editingLot.passportCode}
+              </h3>
+              <button type="button" onClick={() => setEditingLot(null)}>
+                <X className="w-4 h-4 text-slate-500" />
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Listing Rate (EGP / ton)
+              </label>
+              <input
+                type="number"
+                min={500}
+                value={editPrice}
+                onChange={(e) => setEditPrice(Number(e.target.value))}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono font-bold"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Purity Grade</label>
+              <select
+                value={editGrade}
+                onChange={(e) => setEditGrade(e.target.value as PurityGrade)}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              >
+                <option value="Grade A">Grade A</option>
+                <option value="Grade B">Grade B</option>
+                <option value="Grade C">Grade C</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Pickup Window</label>
+              <input
+                type="text"
+                value={editWindow}
+                onChange={(e) => setEditWindow(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Notes</label>
+              <input
+                type="text"
+                value={editNotes}
+                onChange={(e) => setEditNotes(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setEditingLot(null)}
+                className="rounded-lg border border-slate-300 px-4 py-2 text-xs font-semibold text-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={savingEdit}
+                className="rounded-lg bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-xs font-semibold text-white"
+              >
+                {savingEdit ? 'Saving...' : 'Save Changes'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Dispute Modal */}
+      <DisputeModal
+        open={Boolean(disputeTarget)}
+        lang={lang}
+        reservationId={disputeTarget?.reservationId}
+        passportId={disputeTarget?.passportId}
+        referenceLabel={disputeTarget?.label}
+        onClose={() => setDisputeTarget(null)}
+        onSubmitted={() =>
+          setMessage({ type: 'success', text: 'Dispute submitted to OURO Platform Operations.' })
+        }
+      />
     </div>
   );
 };

@@ -14,7 +14,17 @@ export type MaterialCategory = 'paper_cardboard' | 'plastics' | 'metals' | 'orga
 
 export type PurityGrade = 'Grade A' | 'Grade B' | 'Grade C';
 
-export type PickupStatus = 'scheduled' | 'en_route' | 'arrived' | 'picked_up' | 'delivered';
+// Strictly three distinct Waste Passport macro lifecycle states (NEVER conflate DELIVERED with RECYCLED)
+export type LifecycleStatus = 'LISTED' | 'DELIVERED' | 'RECYCLED';
+
+export type PickupStatus =
+  | 'scheduled'
+  | 'accepted'
+  | 'en_route'
+  | 'arrived'
+  | 'picked_up'
+  | 'delivered'
+  | 'cancelled';
 
 export type VerificationMethod = 'ble_scale' | 'manual_calibrated';
 
@@ -38,7 +48,36 @@ export const FACILITY_TYPE_LABELS: Record<FacilityType, { en: string; ar: string
 
 export const HUB_TYPE_LABELS = FACILITY_TYPE_LABELS;
 
-// Explicit EPA WARM v16 / IPCC 2006 Avoided Emission Factors (metric tons CO2e per metric ton recycled)
+export const LIFECYCLE_STATUS_LABELS: Record<LifecycleStatus, { en: string; ar: string }> = {
+  LISTED: { en: 'Listed', ar: 'مُدرج في السوق' },
+  DELIVERED: { en: 'Delivered (Awaiting Recycling)', ar: 'تم التسليم (بانتظار التدوير)' },
+  RECYCLED: { en: 'Verified Recycled', ar: 'تم التدوير المعتمد' },
+};
+
+export const ROLE_LABELS: Record<UserRole, { en: string; ar: string }> = {
+  generator_ops: { en: 'Waste Generator Operations', ar: 'عمليات مولد المخلفات' },
+  factory_procurement: { en: 'Recycling Factory Procurement', ar: 'مشتريات مصنع التدوير' },
+  driver_3pl: { en: 'Certified 3PL Logistics Partner', ar: 'شريك النقل البيئي المعتمد (3PL)' },
+  platform_admin: { en: 'OURO Platform Admin', ar: 'إدارة منصة أورو' },
+};
+
+export const DISPUTE_CATEGORIES = [
+  { value: 'weight_discrepancy', id: 'weight_discrepancy', en: 'Weight Discrepancy', ar: 'اختلاف الوزن' },
+  { value: 'purity_contamination', id: 'purity_contamination', en: 'Purity / Contamination', ar: 'نقاء / شوائب بالمادة' },
+  { value: 'delayed_pickup', id: 'delayed_pickup', en: 'Delayed 3PL Pickup', ar: 'تأخر شركة النقل' },
+  { value: 'documentation', id: 'documentation', en: 'Missing Documentation / Evidence', ar: 'نقص المستندات / الإثباتات' },
+  { value: 'other', id: 'other', en: 'Other Operational Issue', ar: 'مشكلة تشغيلية أخرى' },
+] as const;
+
+export const VEHICLE_TYPES = [
+  { value: 'flatbed_truck', en: 'Flatbed Truck (10t)', ar: 'شاحنة مسطحة (10 طن)' },
+  { value: 'box_truck', en: 'Box Truck (15t)', ar: 'شاحنة صندوقية مغلقة (15 طن)' },
+  { value: 'curtain_sider', en: 'Curtain-Sider Trailer (20t)', ar: 'مقطورة بستارة جانبية (20 طن)' },
+  { value: 'compactor_rolloff', en: 'Roll-Off Compactor (12t)', ar: 'شاحنة ضاغطة (12 طن)' },
+] as const;
+
+// Baseline EPA WARM v16 / IPCC 2006 Avoided Emission Factors (metric tons CO2e per metric ton recycled)
+// Live values are stored & managed in PostgreSQL `emission_factors` table.
 export const MATERIAL_METADATA: Record<
   MaterialCategory,
   {
@@ -95,14 +134,15 @@ export const PASSPORT_STAGES = [
   { stage: 1, en: 'Source Identification', ar: 'تحديد المصدر' },
   { stage: 2, en: 'Data Capture', ar: 'توثيق الوزن والبيانات' },
   { stage: 3, en: 'Digital Listing', ar: 'الإدراج الرقمي' },
-  { stage: 4, en: 'Smart Matching', ar: 'المطابقة الذكية' },
-  { stage: 5, en: 'Transaction Completion', ar: 'إتمام الحجز' },
-  { stage: 6, en: 'Digital Tracking (3PL)', ar: 'التتبع الرقمي للنقل' },
-  { stage: 7, en: 'Verified ESG Impact', ar: 'الأثر البيئي المعتمد' },
+  { stage: 4, en: 'Intelligent Matching', ar: 'المطابقة الذكية' },
+  { stage: 5, en: 'Reservation & Allocation', ar: 'الحجز وتخصيص الكمية' },
+  { stage: 6, en: '3PL Logistics & Delivery', ar: 'النقل والتسليم (3PL)' },
+  { stage: 7, en: 'Verified Recycling & ESG', ar: 'التدوير المعتمد والأثر البيئي' },
 ] as const;
 
 export const PICKUP_STATUS_FLOW: PickupStatus[] = [
   'scheduled',
+  'accepted',
   'en_route',
   'arrived',
   'picked_up',
@@ -111,10 +151,12 @@ export const PICKUP_STATUS_FLOW: PickupStatus[] = [
 
 export const PICKUP_STATUS_LABELS: Record<PickupStatus, { en: string; ar: string }> = {
   scheduled: { en: 'Scheduled', ar: 'مجدول' },
+  accepted: { en: 'Accepted by 3PL', ar: 'مقبول من شركة النقل' },
   en_route: { en: 'En Route', ar: 'في الطريق' },
   arrived: { en: 'Arrived at Facility', ar: 'وصل للمنشأة' },
   picked_up: { en: 'Picked Up', ar: 'تم الاستلام' },
-  delivered: { en: 'Delivered to Factory', ar: 'تم التسليم للمصنع' },
+  delivered: { en: 'Delivered to Recycler', ar: 'تم التسليم للمصنع' },
+  cancelled: { en: 'Cancelled', ar: 'ملغي' },
 };
 
 export function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {

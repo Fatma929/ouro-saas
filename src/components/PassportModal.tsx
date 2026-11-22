@@ -7,11 +7,14 @@ import {
   Leaf,
   Clock,
   ShieldCheck,
+  ShieldAlert,
   Loader2,
   Package,
+  FileDown,
 } from 'lucide-react';
-import { apiFetch } from '../lib/api.ts';
+import { apiFetch, downloadSignedPrivateFile } from '../lib/api.ts';
 import { PassportQRCode } from './PassportQRCode.tsx';
+import { LifecycleBadge } from './ui/DesignSystem.tsx';
 import {
   MATERIAL_METADATA,
   PASSPORT_STAGES,
@@ -36,6 +39,7 @@ export const PassportModal: React.FC<PassportModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [imgError, setImgError] = useState(false);
+  const [downloadingId, setDownloadingId] = useState<number | null>(null);
 
   const t = TRANSLATIONS[lang];
 
@@ -68,9 +72,23 @@ export const PassportModal: React.FC<PassportModalProps> = ({
   const hub = data?.hub;
   const events: any[] = data?.events || [];
   const resList: any[] = data?.reservations || [];
+  const chainIntegrity = data?.chainIntegrity;
+  const reconciliation = data?.reconciliation;
+  const liveFactor = data?.emissionFactor;
   const matMeta = passport
     ? MATERIAL_METADATA[passport.materialCategory as MaterialCategory]
     : null;
+
+  const handleOpenEvidence = async (fileId: number, fallbackName: string) => {
+    setDownloadingId(fileId);
+    try {
+      await downloadSignedPrivateFile(fileId, fallbackName);
+    } catch (err: any) {
+      setError(err.message || 'Unable to access private evidence document.');
+    } finally {
+      setDownloadingId(null);
+    }
+  };
 
   return (
     <div
@@ -81,11 +99,19 @@ export const PassportModal: React.FC<PassportModalProps> = ({
       <div className="relative w-full max-w-4xl max-h-[92vh] overflow-y-auto rounded-2xl bg-white text-[#272F31] shadow-2xl border border-slate-200">
         {/* Header */}
         <div className="sticky top-0 z-10 flex items-center justify-between gap-4 bg-[#272F31] text-white px-6 py-4">
-          <div>
-            <p className="text-xs font-medium text-emerald-300">{t.passport.title}</p>
-            <h2 className="text-lg font-bold font-mono tracking-tight">
-              {passport ? passport.passportCode : String(passportCodeOrId)}
-            </h2>
+          <div className="flex flex-wrap items-center gap-3">
+            <div>
+              <p className="text-xs font-medium text-emerald-300">{t.passport.title}</p>
+              <h2 className="text-lg font-bold font-mono tracking-tight">
+                {passport ? passport.passportCode : String(passportCodeOrId)}
+              </h2>
+            </div>
+            {passport && <LifecycleBadge status={passport.lifecycleStatus} lang={lang} />}
+            {passport?.isSampleData && (
+              <span className="rounded-md bg-white/10 px-2 py-0.5 text-[10px] font-mono text-[#C4A87E]">
+                PILOT SAMPLE
+              </span>
+            )}
           </div>
           <button
             type="button"
@@ -113,6 +139,35 @@ export const PassportModal: React.FC<PassportModalProps> = ({
 
           {!loading && passport && (
             <>
+              {/* Tamper-Evident SHA-256 Chain Integrity Bar */}
+              {chainIntegrity && (
+                <div
+                  className={`rounded-xl border px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs ${
+                    chainIntegrity.valid
+                      ? 'border-emerald-200 bg-emerald-50/70 text-emerald-900'
+                      : 'border-red-300 bg-red-50 text-red-900'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-semibold">
+                    {chainIntegrity.valid ? (
+                      <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
+                    ) : (
+                      <ShieldAlert className="w-4 h-4 text-red-600 shrink-0" />
+                    )}
+                    <span>
+                      {chainIntegrity.valid
+                        ? `SHA-256 Hash Chain Verified · ${chainIntegrity.eventCount} tamper-evident events`
+                        : `Hash Chain Integrity Alert at event #${chainIntegrity.brokenAtEventId}`}
+                    </span>
+                  </div>
+                  {chainIntegrity.latestHash && (
+                    <span className="font-mono text-[11px] opacity-80">
+                      Head: {chainIntegrity.latestHash.slice(0, 16)}…
+                    </span>
+                  )}
+                </div>
+              )}
+
               {/* Top Summary + QR + Photo */}
               <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
                 <div className="md:col-span-5 space-y-4">
@@ -152,7 +207,7 @@ export const PassportModal: React.FC<PassportModalProps> = ({
                   />
                 </div>
 
-                {/* Key Lot Specs */}
+                {/* Key Lot Specs & Full Mass-Balance Reconciliation */}
                 <div className="md:col-span-7 space-y-4">
                   <div>
                     <div className="text-xs font-medium text-slate-500 flex flex-wrap items-center gap-1.5">
@@ -160,9 +215,7 @@ export const PassportModal: React.FC<PassportModalProps> = ({
                       <span aria-hidden="true">·</span>
                       <span>{passport.purityGrade}</span>
                       <span aria-hidden="true">·</span>
-                      <span>
-                        Stage {passport.currentStage} of 7
-                      </span>
+                      <span>Stage {passport.currentStage} of 7</span>
                     </div>
                     <h3 className="text-2xl font-bold text-[#272F31] mt-1">
                       {passport.materialSubtype}
@@ -177,44 +230,96 @@ export const PassportModal: React.FC<PassportModalProps> = ({
                         </span>
                       </p>
                     )}
+                    {passport.notes && (
+                      <p className="text-xs text-slate-600 mt-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                        {passport.notes}
+                      </p>
+                    )}
+                    {passport.supportingDocFileId && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleOpenEvidence(
+                            passport.supportingDocFileId,
+                            passport.supportingDocName || 'supporting-document'
+                          )
+                        }
+                        className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 hover:underline"
+                      >
+                        <FileDown className="w-3.5 h-3.5" />
+                        <span>{passport.supportingDocName || 'Download Supporting Document'}</span>
+                      </button>
+                    )}
                   </div>
 
-                  {/* Quantitative Specs Grid */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-200">
-                    <div>
-                      <p className="text-xs text-slate-500">Initial Weight</p>
+                  {/* Quantitative Mass-Balance Reconciliation Grid */}
+                  {reconciliation && (
+                    <div className="rounded-xl border border-slate-200 bg-[#F8FAFC] p-3.5">
+                      <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-2">
+                        Quantity Reconciliation (Metric Tons)
+                      </p>
+                      <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 text-center">
+                        <div className="rounded-lg bg-white border border-slate-200 p-2">
+                          <p className="text-[10px] text-slate-500">Listed</p>
+                          <p className="text-sm font-bold font-mono tabular-nums text-[#272F31]">
+                            {reconciliation.initialTons.toFixed(2)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-white border border-slate-200 p-2">
+                          <p className="text-[10px] text-slate-500">Available</p>
+                          <p className="text-sm font-bold font-mono tabular-nums text-slate-700">
+                            {reconciliation.availableTons.toFixed(2)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-white border border-slate-200 p-2">
+                          <p className="text-[10px] text-slate-500">Reserved</p>
+                          <p className="text-sm font-bold font-mono tabular-nums text-slate-700">
+                            {reconciliation.reservedTons.toFixed(2)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-amber-50 border border-amber-200 p-2">
+                          <p className="text-[10px] text-amber-800">Delivered</p>
+                          <p className="text-sm font-bold font-mono tabular-nums text-amber-900">
+                            {reconciliation.deliveredTons.toFixed(2)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-emerald-50 border border-emerald-200 p-2">
+                          <p className="text-[10px] text-emerald-800">Recycled</p>
+                          <p className="text-sm font-bold font-mono tabular-nums text-emerald-800">
+                            {reconciliation.recycledTons.toFixed(2)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg bg-white border border-slate-200 p-2">
+                          <p className="text-[10px] text-slate-500">Resid./Loss</p>
+                          <p className="text-sm font-bold font-mono tabular-nums text-slate-600">
+                            {(reconciliation.residualTons + reconciliation.rejectedTons).toFixed(2)}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Pricing & Net Verified ESG */}
+                  <div className="grid grid-cols-2 gap-3 pt-1">
+                    <div className="rounded-lg border border-slate-200 p-3">
+                      <p className="text-xs text-slate-500">Marketplace Rate</p>
                       <p className="text-base font-bold font-mono tabular-nums text-[#272F31]">
-                        {(passport.initialWeightKg / 1000).toFixed(2)} t
-                      </p>
-                      <p className="text-[11px] font-mono text-slate-500">
-                        {passport.initialWeightKg.toLocaleString()} kg
+                        {passport.pricePerTonEgp.toLocaleString()} EGP / ton
                       </p>
                     </div>
-                    <div>
-                      <p className="text-xs text-slate-500">Available / Reserved</p>
-                      <p className="text-base font-bold font-mono tabular-nums text-emerald-700">
-                        {passport.availableTons.toFixed(2)} / {passport.reservedTons.toFixed(2)} t
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-slate-500">Rate (EGP / ton)</p>
-                      <p className="text-base font-bold font-mono tabular-nums text-[#272F31]">
-                        {passport.pricePerTonEgp.toLocaleString()} EGP
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-slate-500">CO2e Factor / Sealed</p>
-                      <p className="text-base font-bold font-mono tabular-nums text-emerald-700">
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-3">
+                      <p className="text-xs text-emerald-800">Verified Net CO2e Avoided</p>
+                      <p className="text-base font-bold font-mono tabular-nums text-emerald-800">
                         {passport.verifiedCo2eTons > 0
                           ? `${passport.verifiedCo2eTons.toFixed(2)} tCO2e`
-                          : `${passport.co2eFactorPerTon} /t`}
+                          : '0.00 tCO2e (Pending Stage 7)'}
                       </p>
                     </div>
                   </div>
 
                   {/* Active / Past 3PL Reservations */}
                   {resList.length > 0 && (
-                    <div className="rounded-xl border border-slate-200 bg-[#F8FAFC] p-4 space-y-2">
+                    <div className="rounded-xl border border-slate-200 bg-[#F8FAFC] p-4 space-y-2.5">
                       <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
                         <Truck className="w-3.5 h-3.5 text-emerald-600" />
                         <span>Linked Factory Reservations & Certified 3PL Custody</span>
@@ -222,25 +327,75 @@ export const PassportModal: React.FC<PassportModalProps> = ({
                       {resList.map((r) => (
                         <div
                           key={r.id}
-                          className="flex flex-wrap items-center justify-between gap-2 text-xs pt-2 border-t border-slate-200 first:border-t-0 first:pt-0"
+                          className="space-y-1.5 text-xs pt-2.5 border-t border-slate-200 first:border-t-0 first:pt-0"
                         >
-                          <div>
-                            <span className="font-mono font-semibold text-[#272F31]">
-                              {r.reservationCode}
-                            </span>
-                            <span className="text-slate-500 mx-1.5">·</span>
-                            <span className="font-medium text-slate-800">{r.factoryNameEn}</span>
-                            <div className="text-slate-500 mt-0.5">
-                              3PL: {r.logisticsProviderNameEn} · License{' '}
-                              <span className="font-mono text-[#272F31]">{r.logisticsProviderLicense}</span>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <span className="font-mono font-semibold text-[#272F31]">
+                                {r.reservationCode}
+                              </span>
+                              <span className="text-slate-400 mx-1.5">·</span>
+                              <span className="font-medium text-slate-800">{r.factoryNameEn}</span>
+                              <div className="text-slate-500 mt-0.5">
+                                3PL: {r.logisticsProviderNameEn} · License{' '}
+                                <span className="font-mono text-[#272F31]">{r.logisticsProviderLicense}</span>
+                              </div>
+                            </div>
+                            <div className="text-right font-mono tabular-nums">
+                              <span className="font-semibold text-[#272F31]">{r.quantityTons} t</span>
+                              <span className="text-slate-400 mx-1">·</span>
+                              <span className="font-semibold text-emerald-700 capitalize">
+                                {String(r.pickupStatus).replace('_', ' ')}
+                              </span>
+                              {r.recyclingStatus === 'verified_recycled' && (
+                                <div className="text-[11px] text-emerald-700">
+                                  Recovered: {r.recoveredTons} t · Net {r.co2eAvoidedTons} tCO2e
+                                </div>
+                              )}
                             </div>
                           </div>
-                          <div className="text-right font-mono tabular-nums">
-                            <span className="font-semibold text-[#272F31]">{r.quantityTons} t</span>
-                            <span className="text-slate-500 mx-1">·</span>
-                            <span className="font-semibold text-emerald-700 capitalize">
-                              {String(r.pickupStatus).replace('_', ' ')}
-                            </span>
+                          {/* Evidence Links */}
+                          <div className="flex flex-wrap gap-3 pt-0.5">
+                            {r.podFileId && (
+                              <button
+                                type="button"
+                                disabled={downloadingId === r.podFileId}
+                                onClick={() => handleOpenEvidence(r.podFileId, r.podFileName || 'pod')}
+                                className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 hover:underline"
+                              >
+                                <FileDown className="w-3 h-3" />
+                                <span>3PL POD: {r.podFileName || 'View'}</span>
+                              </button>
+                            )}
+                            {r.weighbridgeFileId && (
+                              <button
+                                type="button"
+                                disabled={downloadingId === r.weighbridgeFileId}
+                                onClick={() =>
+                                  handleOpenEvidence(r.weighbridgeFileId, r.weighbridgeFileName || 'weighbridge')
+                                }
+                                className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 hover:underline"
+                              >
+                                <FileDown className="w-3 h-3" />
+                                <span>Weighbridge: {r.weighbridgeFileName || 'View'}</span>
+                              </button>
+                            )}
+                            {r.recyclingEvidenceFileId && (
+                              <button
+                                type="button"
+                                disabled={downloadingId === r.recyclingEvidenceFileId}
+                                onClick={() =>
+                                  handleOpenEvidence(
+                                    r.recyclingEvidenceFileId,
+                                    r.recyclingEvidenceName || 'recycling-evidence'
+                                  )
+                                }
+                                className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-800 hover:underline"
+                              >
+                                <FileDown className="w-3 h-3" />
+                                <span>Recycling Proof: {r.recyclingEvidenceName || 'View'}</span>
+                              </button>
+                            )}
                           </div>
                         </div>
                       ))}
@@ -288,7 +443,7 @@ export const PassportModal: React.FC<PassportModalProps> = ({
                     <span>{t.passport.auditTrail}</span>
                   </h4>
                   <span className="text-xs font-mono text-slate-500">
-                    {events.length} append-only records
+                    {events.length} hash-chained records
                   </span>
                 </div>
                 <div className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white">
@@ -307,11 +462,14 @@ export const PassportModal: React.FC<PassportModalProps> = ({
                         <p className="text-sm text-slate-700">
                           {lang === 'ar' ? ev.summaryAr : ev.summaryEn}
                         </p>
-                        {ev.lat && ev.lng && (
-                          <p className="text-[11px] font-mono text-slate-400">
-                            GPS: {Number(ev.lat).toFixed(4)}, {Number(ev.lng).toFixed(4)}
-                          </p>
-                        )}
+                        <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-slate-400">
+                          {ev.lat && ev.lng && (
+                            <span>
+                              GPS: {Number(ev.lat).toFixed(4)}, {Number(ev.lng).toFixed(4)}
+                            </span>
+                          )}
+                          {ev.eventHash && <span>SHA-256: {ev.eventHash.slice(0, 12)}…</span>}
+                        </div>
                       </div>
                       <div className="text-xs font-mono text-slate-500 whitespace-nowrap flex items-center gap-1 shrink-0">
                         <Clock className="w-3 h-3" />
@@ -323,16 +481,22 @@ export const PassportModal: React.FC<PassportModalProps> = ({
               </div>
 
               {/* ESG Factor Footer Note */}
-              {matMeta && (
+              {liveFactor && (
                 <div className="flex items-start gap-2.5 rounded-xl bg-slate-50 border border-slate-200 p-3.5 text-xs text-slate-600">
                   <Leaf className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <div>
-                    <span className="font-semibold text-[#272F31]">ESG Methodology Reference: </span>
-                    {matMeta.methodologyRef} — Emission Factor:{' '}
-                    <span className="font-mono font-semibold text-[#272F31]">
-                      {matMeta.co2eFactorPerTon} tCO2e / metric ton
-                    </span>
-                    .
+                  <div className="space-y-1">
+                    <div>
+                      <span className="font-semibold text-[#272F31]">ESG Accounting Standard: </span>
+                      {liveFactor.methodologyName} ({liveFactor.version}) — Material Factor:{' '}
+                      <span className="font-mono font-semibold text-[#272F31]">
+                        {liveFactor.co2eFactorPerTon} tCO2e/t
+                      </span>{' '}
+                      · 3PL Freight Deduction:{' '}
+                      <span className="font-mono font-semibold text-[#272F31]">
+                        {liveFactor.transportFactorKgPerTonKm} kg CO2e/t·km
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500">{liveFactor.boundaryNotes}</p>
                   </div>
                 </div>
               )}

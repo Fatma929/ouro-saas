@@ -1,35 +1,45 @@
-import { count } from 'drizzle-orm';
+import { asc, count, eq, isNull } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   wasteSourceHubs,
   recyclingFactories,
   logisticsProviders,
+  logisticsVehicles,
   users,
   wastePassports,
   reservations,
   passportEvents,
   fileObjects,
   adminAuditLogs,
+  emissionFactors,
+  notifications,
+  disputes,
 } from './schema.ts';
 import { hashPassword } from '../lib/auth-utils.ts';
 import { MATERIAL_METADATA } from '../shared/constants.ts';
+import { DEFAULT_EMISSION_FACTORS, calculateVerifiedRecyclingImpact } from '../lib/esg-engine.ts';
+import { computePassportEventHash } from '../lib/passport-chain.ts';
 
 let seedPromise: Promise<void> | null = null;
 
 export async function ensureSeeded(): Promise<void> {
   if (seedPromise) return seedPromise;
-  seedPromise = runSeedIfEmpty().catch((err) => {
+  seedPromise = runSeedAndBackfill().catch((err) => {
     seedPromise = null;
     throw err;
   });
   return seedPromise;
 }
 
-async function runSeedIfEmpty(): Promise<void> {
+async function runSeedAndBackfill(): Promise<void> {
   const existing = await db.select({ total: count() }).from(wasteSourceHubs);
-  if ((existing[0]?.total ?? 0) > 0) {
-    return;
+  if ((existing[0]?.total ?? 0) === 0) {
+    await runSeedIfEmpty();
   }
+  await ensurePilotEnhancementsBackfilled();
+}
+
+async function runSeedIfEmpty(): Promise<void> {
 
   console.log('Seeding OURO Egypt & MENA production pilot dataset...');
 
@@ -741,3 +751,358 @@ async function runSeedIfEmpty(): Promise<void> {
 
   console.log('OURO pilot dataset seeded successfully.');
 }
+
+/**
+ * Idempotent upgrade backfill so existing live Cloud SQL databases immediately gain:
+ * - Versioned emission_factors table
+ * - Verified external 3PL logistics_vehicles
+ * - Strict DELIVERED vs RECYCLED status & quantity reconciliation on seeded records
+ * - Object-level owner metadata on seeded KYC files
+ * - SHA-256 hash chain backfilled on all passport_events
+ * - Starter in-app notifications and sample dispute for audit workflows
+ */
+async function ensurePilotEnhancementsBackfilled(): Promise<void> {
+  // 1. Seed default emission factors if empty
+  const efCount = await db.select({ total: count() }).from(emissionFactors);
+  if ((efCount[0]?.total ?? 0) === 0) {
+    await db
+      .insert(emissionFactors)
+      .values(
+        DEFAULT_EMISSION_FACTORS.map((ef) => ({
+          materialCategory: ef.materialCategory,
+          labelEn: ef.labelEn,
+          labelAr: ef.labelAr,
+          co2eFactorPerTon: ef.co2eFactorPerTon,
+          transportFactorKgPerTonKm: ef.transportFactorKgPerTonKm,
+          methodologyName: ef.methodologyName,
+          sourceRef: ef.sourceRef,
+          version: ef.version,
+          boundaryNotes: ef.boundaryNotes,
+          baselineScenario: ef.baselineScenario,
+          dataQualityTier: ef.dataQualityTier,
+          updatedByEmail: 'system@ouro.eco',
+        }))
+      )
+      .onConflictDoNothing();
+  }
+
+  // 2. Seed external 3PL vehicles if empty
+  const vehCount = await db.select({ total: count() }).from(logisticsVehicles);
+  if ((vehCount[0]?.total ?? 0) === 0) {
+    const providers = await db.select().from(logisticsProviders).orderBy(asc(logisticsProviders.id));
+    if (providers.length > 0) {
+      await db
+        .insert(logisticsVehicles)
+        .values([
+          {
+            logisticsProviderId: providers[0].id,
+            plateNumber: 'GIZ-4821-EG',
+            vehicleType: 'box_truck',
+            capacityTons: 12,
+            envPermitNo: 'EEAA-VEH-2026-0148-A',
+            permitExpiry: '2028-06-30',
+            driverName: 'Mahmoud Saeed',
+            verificationStatus: 'verified',
+            isActive: true,
+          },
+          {
+            logisticsProviderId: providers[0].id,
+            plateNumber: 'CAI-7190-EG',
+            vehicleType: 'flatbed',
+            capacityTons: 18,
+            envPermitNo: 'EEAA-VEH-2026-0148-B',
+            permitExpiry: '2028-06-30',
+            driverName: 'Youssef Abdel-Nasser',
+            verificationStatus: 'verified',
+            isActive: true,
+          },
+          {
+            logisticsProviderId: providers[Math.min(1, providers.length - 1)].id,
+            plateNumber: 'SHQ-3052-EG',
+            vehicleType: 'roll_off',
+            capacityTons: 20,
+            envPermitNo: 'EEAA-VEH-2026-0219-A',
+            permitExpiry: '2027-12-31',
+            driverName: 'Hassan Ibrahim',
+            verificationStatus: 'verified',
+            isActive: true,
+          },
+          {
+            logisticsProviderId: providers[Math.min(2, providers.length - 1)].id,
+            plateNumber: 'MNF-9415-EG',
+            vehicleType: 'compactor',
+            capacityTons: 15,
+            envPermitNo: 'EEAA-VEH-2026-0304-A',
+            permitExpiry: '2028-03-15',
+            driverName: 'Khaled Mansour',
+            verificationStatus: 'verified',
+            isActive: true,
+          },
+        ])
+        .onConflictDoNothing();
+    }
+  }
+
+  // 3. Ensure seeded KYC file has proper ownerOrgType / ownerOrgId for strict object-level ACLs
+  const pendingFactories = await db
+    .select()
+    .from(recyclingFactories)
+    .where(eq(recyclingFactories.kycStatus, 'pending'));
+  for (const fac of pendingFactories) {
+    if (fac.kycDocumentFileId) {
+      await db
+        .update(fileObjects)
+        .set({
+          ownerOrgType: 'factory',
+          ownerOrgId: fac.id,
+          linkedEntityType: 'recycling_factory',
+          linkedEntityId: fac.id,
+        })
+        .where(eq(fileObjects.id, fac.kycDocumentFileId));
+    }
+  }
+
+  // 4. Reconcile the two seeded historical completed lots to clearly separate RECYCLED vs DELIVERED:
+  //    - OURO-PAS-2026-308A11 (12t Paper) -> Verified RECYCLED (Stage 7, 11.4t recovered, 0.4t residual, 0.2t loss)
+  //    - OURO-PAS-2026-205B94 (8.5t Steel) -> DELIVERED only (Stage 6, awaiting recycling verification, 0 verified CO2e)
+  const paperFactor = DEFAULT_EMISSION_FACTORS.find((f) => f.materialCategory === 'paper_cardboard')!;
+  const metalFactor = DEFAULT_EMISSION_FACTORS.find((f) => f.materialCategory === 'metals')!;
+
+  const paperLot = await db
+    .select()
+    .from(wastePassports)
+    .where(eq(wastePassports.passportCode, 'OURO-PAS-2026-308A11'))
+    .limit(1);
+  if (paperLot.length > 0 && paperLot[0].recycledTons === 0) {
+    const impact = calculateVerifiedRecyclingImpact({
+      recoveredTons: 11.4,
+      deliveredTons: 12.0,
+      residualTons: 0.4,
+      lossTons: 0.2,
+      transportDistanceKm: 68.5,
+      factor: paperFactor,
+      hasWeighbridgeTicket: true,
+      hasRecyclingEvidence: true,
+    });
+    await db
+      .update(wastePassports)
+      .set({
+        collectedTons: 12.0,
+        deliveredTons: 12.0,
+        recycledTons: 11.4,
+        residualTons: 0.4,
+        rejectedTons: 0.2,
+        currentStage: 7,
+        status: 'recycled',
+        lifecycleStatus: 'RECYCLED',
+        verifiedCo2eTons: impact.netVerifiedCo2eTons,
+        emissionFactorVersion: impact.factorVersion,
+        isSampleData: true,
+      })
+      .where(eq(wastePassports.id, paperLot[0].id));
+
+    await db
+      .update(reservations)
+      .set({
+        receiptStatus: 'received',
+        receivedAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 4.5),
+        receivedWeightKg: 11980,
+        recyclingStatus: 'verified_recycled',
+        recycledAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 4),
+        recoveredTons: 11.4,
+        residualTons: 0.4,
+        lossTons: 0.2,
+        recyclingNotes:
+          'Pulped into recycled kraft linerboard at Nile Kraft Mill; 0.4t moisture/binding tape residual disposed properly, 0.2t fiber loss.',
+        transportDistanceKm: 68.5,
+        transportEmissionsTons: impact.transportEmissionsTons,
+        estimatedCo2eTons: Number((12.0 * paperFactor.co2eFactorPerTon).toFixed(3)),
+        co2eAvoidedTons: impact.netVerifiedCo2eTons,
+        esgConfidenceLevel: 'verified',
+      })
+      .where(eq(reservations.reservationCode, 'OURO-RES-2026-098X'));
+  }
+
+  const steelLot = await db
+    .select()
+    .from(wastePassports)
+    .where(eq(wastePassports.passportCode, 'OURO-PAS-2026-205B94'))
+    .limit(1);
+  if (steelLot.length > 0 && steelLot[0].status === 'verified_esg' && steelLot[0].recycledTons === 0) {
+    // Keep this lot at DELIVERED (Stage 6) so dashboards & factories clearly show Delivered ≠ Recycled
+    await db
+      .update(wastePassports)
+      .set({
+        collectedTons: 8.5,
+        deliveredTons: 8.5,
+        recycledTons: 0,
+        residualTons: 0,
+        rejectedTons: 0,
+        currentStage: 6,
+        status: 'delivered',
+        lifecycleStatus: 'DELIVERED',
+        verifiedCo2eTons: 0,
+        isSampleData: true,
+      })
+      .where(eq(wastePassports.id, steelLot[0].id));
+
+    await db
+      .update(reservations)
+      .set({
+        receiptStatus: 'received',
+        receivedAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 9.5),
+        receivedWeightKg: 8510,
+        recyclingStatus: 'pending_recycling',
+        recoveredTons: 0,
+        residualTons: 0,
+        lossTons: 0,
+        transportDistanceKm: 82.0,
+        transportEmissionsTons: Number(((8.5 * 82.0 * metalFactor.transportFactorKgPerTonKm) / 1000).toFixed(3)),
+        estimatedCo2eTons: Number((8.5 * metalFactor.co2eFactorPerTon).toFixed(3)),
+        co2eAvoidedTons: 0,
+        esgConfidenceLevel: 'estimated',
+      })
+      .where(eq(reservations.reservationCode, 'OURO-RES-2026-095Z'));
+  }
+
+  // Ensure active non-delivered seeded reservations have estimatedCo2eTons populated and co2eAvoidedTons = 0 (not yet recycled)
+  const allRes = await db.select().from(reservations);
+  for (const r of allRes) {
+    if (r.recyclingStatus !== 'verified_recycled' && r.co2eAvoidedTons > 0 && r.estimatedCo2eTons === 0) {
+      await db
+        .update(reservations)
+        .set({
+          estimatedCo2eTons: r.co2eAvoidedTons,
+          co2eAvoidedTons: 0,
+          esgConfidenceLevel: 'estimated',
+        })
+        .where(eq(reservations.id, r.id));
+    }
+  }
+
+  // Mark remaining seeded pilot passports with isSampleData = true
+  const seededCodes = [
+    'OURO-PAS-2026-841A2C',
+    'OURO-PAS-2026-912B4F',
+    'OURO-PAS-2026-733E19',
+    'OURO-PAS-2026-504D8A',
+    'OURO-PAS-2026-621F03',
+    'OURO-PAS-2026-419C77',
+    'OURO-PAS-2026-308A11',
+    'OURO-PAS-2026-205B94',
+  ];
+  for (const code of seededCodes) {
+    await db
+      .update(wastePassports)
+      .set({ isSampleData: true })
+      .where(eq(wastePassports.passportCode, code));
+  }
+
+  // 5. Backfill SHA-256 hash chains on any passport_events that do not yet have event_hash populated
+  const unhashedEvents = await db
+    .select({ passportId: passportEvents.passportId })
+    .from(passportEvents)
+    .where(eq(passportEvents.eventHash, ''));
+
+  if (unhashedEvents.length > 0) {
+    const distinctPassportIds = Array.from(new Set(unhashedEvents.map((e) => e.passportId)));
+    for (const pid of distinctPassportIds) {
+      const evs = await db
+        .select()
+        .from(passportEvents)
+        .where(eq(passportEvents.passportId, pid))
+        .orderBy(asc(passportEvents.id));
+
+      let prevHash = 'GENESIS';
+      for (const ev of evs) {
+        const eventHash = computePassportEventHash(prevHash, {
+          passportId: ev.passportId,
+          stage: ev.stage,
+          eventType: ev.eventType,
+          actorName: ev.actorName,
+          actorRole: ev.actorRole,
+          summaryEn: ev.summaryEn,
+          metadataJson: ev.metadataJson,
+          evidenceFileId: ev.evidenceFileId,
+        });
+        await db
+          .update(passportEvents)
+          .set({ prevHash, eventHash })
+          .where(eq(passportEvents.id, ev.id));
+        prevHash = eventHash;
+      }
+    }
+  }
+
+  // 6. Seed starter notifications if empty
+  const notifCount = await db.select({ total: count() }).from(notifications);
+  if ((notifCount[0]?.total ?? 0) === 0) {
+    const adminUsers = await db.select().from(users).where(eq(users.role, 'platform_admin'));
+    const factoryUsers = await db.select().from(users).where(eq(users.role, 'factory_procurement'));
+    const starterNotifs: Array<typeof notifications.$inferInsert> = [];
+    for (const adm of adminUsers) {
+      starterNotifs.push({
+        userId: adm.id,
+        targetRole: 'platform_admin',
+        type: 'kyc',
+        titleEn: 'Factory KYC Review Pending',
+        titleAr: 'طلب اعتماد مصنع قيد المراجعة',
+        messageEn: 'Delta Polymer & Fiber Recycling S.A.E. submitted Tax & CR verification documents.',
+        messageAr: 'قدمت شركة دلتا لتدوير البوليمرات مستندات السجل التجاري والبطاقة الضريبية.',
+        entityType: 'recycling_factory',
+        entityId: '3',
+      });
+    }
+    if (factoryUsers[0]) {
+      starterNotifs.push({
+        userId: factoryUsers[0].id,
+        targetRole: 'factory_procurement',
+        type: 'recycling',
+        titleEn: 'Verified Recycling Certificate Ready',
+        titleAr: 'شهادة إعادة التدوير المعتمدة جاهزة',
+        messageEn:
+          'Passport OURO-PAS-2026-308A11 completed Stage 7 verified recycling (11.4t recovered output).',
+        messageAr: 'أكمل الجواز OURO-PAS-2026-308A11 المرحلة 7 من التحقق (11.4 طن مواد مستردة).',
+        entityType: 'passport',
+        entityId: 'OURO-PAS-2026-308A11',
+      });
+    }
+    if (starterNotifs.length > 0) {
+      await db.insert(notifications).values(starterNotifs);
+    }
+  }
+
+  // 7. Seed 1 starter open dispute for governance desk visibility if empty
+  const dispCount = await db.select({ total: count() }).from(disputes);
+  if ((dispCount[0]?.total ?? 0) === 0) {
+    const steelRes = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.reservationCode, 'OURO-RES-2026-095Z'))
+      .limit(1);
+    const factoryUser = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, 'procurement@nilekraft.eg'))
+      .limit(1);
+
+    if (steelRes.length > 0 && factoryUser.length > 0) {
+      await db.insert(disputes).values({
+        disputeCode: 'OURO-DSP-2026-001',
+        reservationId: steelRes[0].id,
+        passportId: steelRes[0].passportId,
+        raisedByUserId: factoryUser[0].id,
+        raisedByOrgName: 'Nile Kraft Paper & Packaging Recycling S.A.E.',
+        category: 'weight_discrepancy',
+        severity: 'medium',
+        status: 'open',
+        description:
+          '[Weighbridge Intake Reconciliation] Delivered ferrous steel shipment OURO-RES-2026-095Z weighed 8,510 kg at intake vs 8,500 kg listed; awaiting smelter batch log before sealing Stage 7.',
+      });
+    }
+  }
+
+  // Silence unused import lint if isNull not needed
+  void isNull;
+}
+

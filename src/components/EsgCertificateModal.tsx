@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, Printer, Download, ShieldCheck, Loader2 } from 'lucide-react';
+import { X, Printer, Download, ShieldCheck, Loader2, AlertTriangle } from 'lucide-react';
 import { apiFetch, downloadAuthenticatedCsv } from '../lib/api.ts';
 import { OuroLogo } from './OuroLogo.tsx';
 
@@ -41,7 +41,7 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
     try {
       await downloadAuthenticatedCsv(
         '/api/esg/export.csv',
-        `OURO_ESG_Verified_Ledger_${new Date().toISOString().slice(0, 10)}.csv`
+        `OURO_ESG_Verified_Recycled_Ledger_${new Date().toISOString().slice(0, 10)}.csv`
       );
     } catch (err: any) {
       setError(err.message || 'CSV download failed');
@@ -56,7 +56,7 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
       role="dialog"
       aria-modal="true"
     >
-      <div className="w-full max-w-4xl max-h-[92vh] overflow-y-auto rounded-2xl bg-white text-[#272F31] shadow-2xl border border-slate-200">
+      <div className="w-full max-w-5xl max-h-[92vh] overflow-y-auto rounded-2xl bg-white text-[#272F31] shadow-2xl border border-slate-200">
         {/* Action Bar (hidden when printing) */}
         <div className="no-print sticky top-0 z-10 flex flex-wrap items-center justify-between gap-3 bg-[#272F31] px-6 py-4 text-white">
           <div className="flex items-center gap-2">
@@ -71,7 +71,7 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
               className="inline-flex items-center gap-1.5 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-xs font-semibold text-white transition-colors whitespace-nowrap"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>{downloading ? 'Exporting...' : 'Download CSV Ledger'}</span>
+              <span>{downloading ? 'Exporting...' : 'Download Verified CSV'}</span>
             </button>
             <button
               type="button"
@@ -98,7 +98,7 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
           {loading && (
             <div className="flex items-center justify-center py-16 text-slate-500 gap-2">
               <Loader2 className="w-5 h-5 animate-spin text-emerald-600" />
-              <span className="text-sm font-medium">Compiling verified Stage-7 Passports...</span>
+              <span className="text-sm font-medium">Compiling verified Stage-7 Recycling Ledger...</span>
             </div>
           )}
 
@@ -114,10 +114,10 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
                 <div>
                   <OuroLogo variant="dark" size="lg" showTagline />
                   <h1 className="text-2xl font-extrabold text-[#272F31] mt-4">
-                    Verified Circular Economy ESG Certificate
+                    Verified Circular Economy ESG Impact Statement
                   </h1>
                   <p className="text-xs text-slate-600 mt-1">
-                    Chain-of-Custody Verified Stage 7 Digital Waste Passports · Egypt & MENA Operations
+                    Strictly Stage-7 Verified Recycled Outcomes · Transport-Adjusted Net GHG Accounting
                   </p>
                 </div>
                 <div className="text-left sm:text-right font-mono text-xs space-y-1">
@@ -125,87 +125,110 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
                   <p className="text-slate-500">
                     Issued: {new Date(report.generatedAt).toLocaleString()}
                   </p>
-                  <p className="text-emerald-700 font-semibold">Status: Audit-Ready Ledger</p>
+                  <p className="text-emerald-700 font-semibold">Audit-Ready Verified Ledger</p>
                 </div>
               </div>
 
-              {/* Headline Totals */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="rounded-xl border border-slate-200 bg-[#F6F7F7] p-4">
-                  <p className="text-xs font-medium text-slate-500">Verified Diverted Material</p>
-                  <p className="text-2xl font-extrabold font-mono tabular-nums text-[#272F31] mt-1">
-                    {report.totalVerifiedTons.toFixed(2)} metric tons
+              {/* Headline Totals — Strictly Verified vs Pending */}
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-4">
+                  <p className="text-xs font-medium text-emerald-800">Verified Recycled Output</p>
+                  <p className="text-2xl font-extrabold font-mono tabular-nums text-emerald-900 mt-1">
+                    {Number(report.totalVerifiedRecycledTons ?? report.totalVerifiedTons).toFixed(2)} t
+                  </p>
+                  <p className="text-[11px] text-emerald-700 mt-0.5">
+                    Residual/Loss: {Number(report.totalResidualAndLossTons || 0).toFixed(2)} t
                   </p>
                 </div>
-                <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-4">
-                  <p className="text-xs font-medium text-emerald-800">Avoided GHG Emissions</p>
-                  <p className="text-2xl font-extrabold font-mono tabular-nums text-emerald-700 mt-1">
-                    {report.totalCo2eAvoidedTons.toFixed(2)} tCO2e
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-4">
+                  <p className="text-xs font-medium text-emerald-800">Net Verified CO2e Avoided</p>
+                  <p className="text-2xl font-extrabold font-mono tabular-nums text-emerald-800 mt-1">
+                    {Number(report.totalCo2eAvoidedTons).toFixed(2)} tCO2e
+                  </p>
+                  <p className="text-[11px] text-emerald-700 mt-0.5">
+                    After −{Number(report.totalTransportEmissionsTons || 0).toFixed(3)} t freight
+                  </p>
+                </div>
+                <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-4">
+                  <p className="text-xs font-medium text-amber-800">Delivered (Pending Recycling)</p>
+                  <p className="text-2xl font-extrabold font-mono tabular-nums text-amber-900 mt-1">
+                    {Number(report.totalDeliveredPendingTons || 0).toFixed(2)} t
+                  </p>
+                  <p className="text-[11px] text-amber-700 mt-0.5">
+                    Excluded from verified CO2e totals
                   </p>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-[#F6F7F7] p-4">
-                  <p className="text-xs font-medium text-slate-500">Sealed Stage-7 Passports</p>
+                  <p className="text-xs font-medium text-slate-500">Stage-7 Verified Lots</p>
                   <p className="text-2xl font-extrabold font-mono tabular-nums text-[#272F31] mt-1">
                     {report.items.length} lots
                   </p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    {report.deliveredPendingItems?.length || 0} delivered awaiting proof
+                  </p>
                 </div>
               </div>
 
-              {/* Itemized Passport Table */}
+              {/* Itemized Verified Stage-7 Recycled Passports */}
               <div>
                 <h2 className="text-sm font-bold text-[#272F31] mb-2">
-                  Itemized Verified Digital Waste Passports
+                  Itemized Verified Recycled Outcomes (Stage 7 — Included in ESG Claims)
                 </h2>
                 <div className="overflow-x-auto rounded-xl border border-slate-200">
                   <table className="w-full text-left border-collapse text-xs">
                     <thead>
                       <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
-                        <th className="py-2.5 px-3 font-semibold">Passport ID</th>
-                        <th className="py-2.5 px-3 font-semibold">Waste Generator</th>
-                        <th className="py-2.5 px-3 font-semibold">Recycling Factory</th>
-                        <th className="py-2.5 px-3 font-semibold">3PL License</th>
+                        <th className="py-2.5 px-3 font-semibold">Passport</th>
+                        <th className="py-2.5 px-3 font-semibold">Generator & Recycler</th>
                         <th className="py-2.5 px-3 font-semibold">Material</th>
-                        <th className="py-2.5 px-3 font-semibold text-right">Net Tons</th>
-                        <th className="py-2.5 px-3 font-semibold text-right">Factor</th>
-                        <th className="py-2.5 px-3 font-semibold text-right">Avoided tCO2e</th>
+                        <th className="py-2.5 px-3 font-semibold text-right">Recovered / Deliv.</th>
+                        <th className="py-2.5 px-3 font-semibold text-right">Freight CO2e</th>
+                        <th className="py-2.5 px-3 font-semibold text-right">Net CO2e</th>
+                        <th className="py-2.5 px-3 font-semibold text-right">Confidence</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {report.items.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="py-8 text-center text-slate-500">
-                            No sealed Stage-7 deliveries recorded yet. Complete a 3PL delivery to seal a Passport.
+                          <td colSpan={7} className="py-8 text-center text-slate-500">
+                            No Stage-7 verified recycling outcomes recorded yet. Delivered shipments must be verified by the recycling facility before entering this ledger.
                           </td>
                         </tr>
                       ) : (
                         report.items.map((item: any) => (
                           <tr key={item.reservationCode} className="hover:bg-slate-50/70">
                             <td className="py-2.5 px-3 font-mono font-semibold text-[#272F31]">
-                              {item.passportCode}
+                              <div>{item.passportCode}</div>
+                              {item.isSampleData && (
+                                <span className="text-[10px] text-amber-700 font-normal">Pilot sample</span>
+                              )}
                             </td>
                             <td className="py-2.5 px-3">
                               <div className="font-medium text-[#272F31]">{item.hubNameEn}</div>
-                              <div className="text-[11px] text-slate-500">{item.hubGovernorate}</div>
-                            </td>
-                            <td className="py-2.5 px-3">
-                              <div className="font-medium text-[#272F31]">{item.factoryNameEn}</div>
-                              <div className="text-[11px] font-mono text-slate-500">Tax: {item.factoryTaxId}</div>
-                            </td>
-                            <td className="py-2.5 px-3 font-mono text-[11px] text-slate-700">
-                              {item.logisticsLicenseId}
+                              <div className="text-[11px] text-slate-500">
+                                → {item.factoryNameEn} (Tax: {item.factoryTaxId})
+                              </div>
                             </td>
                             <td className="py-2.5 px-3">
                               <div>{item.materialLabel}</div>
-                              <div className="text-[11px] text-slate-500">{item.purityGrade}</div>
+                              <div className="text-[11px] text-slate-500">
+                                {item.purityGrade} · {item.co2eFactorPerTon.toFixed(2)} t/t
+                              </div>
                             </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold">
-                              {item.verifiedTons.toFixed(2)}
+                            <td className="py-2.5 px-3 text-right font-mono tabular-nums">
+                              <div className="font-bold text-emerald-800">{item.recoveredTons.toFixed(2)} t</div>
+                              <div className="text-[10px] text-slate-500">of {item.deliveredTons.toFixed(2)} t</div>
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">
-                              {item.co2eFactorPerTon.toFixed(2)}
+                              −{Number(item.transportEmissionsTons || 0).toFixed(3)}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-emerald-700">
-                              {item.co2eAvoidedTons.toFixed(2)}
+                              {item.co2eAvoidedTons.toFixed(2)} t
+                            </td>
+                            <td className="py-2.5 px-3 text-right">
+                              <span className="inline-block rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold uppercase text-emerald-800">
+                                {item.esgConfidenceLevel}
+                              </span>
                             </td>
                           </tr>
                         ))
@@ -215,21 +238,63 @@ export const EsgCertificateModal: React.FC<EsgCertificateModalProps> = ({ open, 
                 </div>
               </div>
 
-              {/* Explicit Methodology Disclosure */}
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-2">
-                <h3 className="text-xs font-bold text-[#272F31]">
-                  Documented Emission Factors & Accounting Methodology (EPA WARM v16 / IPCC 2006)
-                </h3>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-600">
-                  {report.emissionFactors.map((ef: any) => (
-                    <div key={ef.category} className="flex justify-between gap-2 border-b border-slate-200/70 pb-1">
-                      <div>
-                        <span className="font-semibold text-[#272F31]">{ef.label}</span>
-                        <span className="block text-[11px] text-slate-500">{ef.methodologyRef}</span>
+              {/* Separate Table for Delivered-Only (Pending Recycling Verification) */}
+              {report.deliveredPendingItems && report.deliveredPendingItems.length > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-4 space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-amber-900">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>
+                      Delivered Shipments Pending Recycling Verification (NOT counted in Verified Recycled Totals)
+                    </span>
+                  </div>
+                  <div className="divide-y divide-amber-200/60 text-xs">
+                    {report.deliveredPendingItems.map((item: any) => (
+                      <div key={item.reservationCode} className="py-2 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="font-mono font-bold text-[#272F31]">{item.passportCode}</span>
+                          <span className="text-slate-500 mx-1.5">·</span>
+                          <span>{item.hubNameEn} → {item.factoryNameEn}</span>
+                        </div>
+                        <div className="font-mono tabular-nums text-amber-900">
+                          {item.deliveredTons.toFixed(2)} t delivered · Est. potential ~{Number(item.estimatedCo2eTons || 0).toFixed(2)} tCO2e (unverified)
+                        </div>
                       </div>
-                      <span className="font-mono font-bold text-emerald-700 whitespace-nowrap">
-                        {ef.factor.toFixed(2)} tCO2e/t
-                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Explicit Methodology & Boundary Disclosures */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                <div>
+                  <h3 className="text-xs font-bold text-[#272F31]">
+                    Methodology, System Boundaries & Emission Factor Disclosures
+                  </h3>
+                  {report.methodologyDisclosure && (
+                    <div className="mt-1.5 space-y-1 text-[11px] text-slate-600">
+                      <p>
+                        <strong>Accounting Rule:</strong> {report.methodologyDisclosure.accountingPrinciple}
+                      </p>
+                      <p className="font-mono text-[11px] text-[#272F31]">
+                        {report.methodologyDisclosure.formula}
+                      </p>
+                    </div>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs text-slate-600">
+                  {report.emissionFactors.map((ef: any) => (
+                    <div key={ef.category} className="rounded-lg border border-slate-200 bg-white p-3 space-y-1">
+                      <div className="flex justify-between gap-2">
+                        <span className="font-bold text-[#272F31]">{ef.label}</span>
+                        <span className="font-mono font-bold text-emerald-700 whitespace-nowrap">
+                          {ef.factor.toFixed(2)} tCO2e/t
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500">{ef.methodologyRef}</p>
+                      {ef.boundaryNotes && <p className="text-[11px] text-slate-500">{ef.boundaryNotes}</p>}
+                      {ef.baselineScenario && (
+                        <p className="text-[10px] text-slate-400">Baseline: {ef.baselineScenario}</p>
+                      )}
                     </div>
                   ))}
                 </div>

@@ -10,19 +10,30 @@ export function getAuthToken(): string | null {
   return inMemoryToken;
 }
 
+export function generateIdempotencyKey(prefix = 'ouro'): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 export async function apiFetch<T = any>(
   url: string,
-  options: RequestInit = {}
+  options: RequestInit & { idempotencyKey?: string } = {}
 ): Promise<T> {
-  const headers = new Headers(options.headers || {});
+  const { idempotencyKey, ...fetchOpts } = options;
+  const headers = new Headers(fetchOpts.headers || {});
   if (inMemoryToken) {
     headers.set('Authorization', `Bearer ${inMemoryToken}`);
   }
-  if (!(options.body instanceof FormData) && !headers.has('Content-Type')) {
+  if (idempotencyKey) {
+    headers.set('Idempotency-Key', idempotencyKey);
+  }
+  if (!(fetchOpts.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(url, { ...fetchOpts, headers });
 
   if (!res.ok) {
     let errMessage = `Request failed (${res.status})`;
@@ -52,6 +63,36 @@ export async function downloadAuthenticatedCsv(url: string, filename: string): P
     throw new Error('Failed to download CSV ledger');
   }
   const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+/**
+ * Requests a short-lived HMAC-signed URL for a private file and downloads it securely
+ * without ever using window.open or exposing bearer tokens in query parameters.
+ */
+export async function downloadSignedPrivateFile(
+  fileId: number,
+  fallbackFilename = 'document'
+): Promise<void> {
+  const { signedUrl } = await apiFetch<{ signedUrl: string }>(`/api/storage/${fileId}/sign`, {
+    method: 'POST',
+  });
+  const res = await fetch(signedUrl);
+  if (!res.ok) {
+    throw new Error('Could not retrieve private file');
+  }
+  const blob = await res.blob();
+  const disp = res.headers.get('content-disposition') || '';
+  const match = disp.match(/filename="([^"]+)"/);
+  const filename = match?.[1] || fallbackFilename;
+
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = objectUrl;
