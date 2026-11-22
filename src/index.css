@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", "Cairo", ui-sans-serif, system-ui, sans-serif;
+  --font-arabic: "Cairo", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Exact brand palette extracted from the OURO logo */
+  --color-ouro-charcoal: #272F31;
+  --color-ouro-charcoal-deep: #1B2224;
+  --color-ouro-charcoal-light: #333D40;
+  --color-ouro-teal: #3D7568;
+  --color-ouro-teal-light: #549686;
+  --color-ouro-gold: #A88B64;
+  --color-ouro-gold-dark: #826946;
+  --color-ouro-gold-light: #C4A87E;
+  --color-ouro-canvas: #F6F7F7;
+
+  /* Harmonize emerald utilities to OURO's exact Pine Sage Teal (#3D7568) */
+  --color-emerald-50: #F0F6F4;
+  --color-emerald-100: #DCECE7;
+  --color-emerald-200: #BAD8D0;
+  --color-emerald-300: #8BBDB1;
+  --color-emerald-400: #5E9E8F;
+  --color-emerald-500: #488577;
+  --color-emerald-600: #3D7568;
+  --color-emerald-700: #305E53;
+  --color-emerald-800: #254940;
+  --color-emerald-900: #1B3630;
+  --color-emerald-950: #11231F;
+
+  /* Harmonize amber utilities toward OURO's Brushed Antique Gold (#A88B64) */
+  --color-amber-50: #FAF7F2;
+  --color-amber-100: #F2EBD9;
+  --color-amber-200: #E3D4B5;
+  --color-amber-300: #D1BA8F;
+  --color-amber-400: #BD9E6E;
+  --color-amber-500: #A88B64;
+  --color-amber-600: #8D7350;
+  --color-amber-700: #735C3E;
+  --color-amber-800: #5B4831;
+  --color-amber-900: #463726;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+  }
+
+  html[dir="rtl"] {
+    font-family: var(--font-arabic);
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  body {
+    background: #ffffff !important;
+    color: #272f31 !important;
+  }
+}

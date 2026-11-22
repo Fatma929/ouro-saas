@@ -1,0 +1,6 @@
+{
+  "name": "OURO — Circular Waste Management SaaS",
+  "description": "Closing the Loop, Digitizing the Value. B2B circular-economy SaaS connecting Egyptian & MENA waste generators (factories, companies, educational & service institutions, hotels, and commercial facilities) with verified recycling factories via certified 3PL logistics and 7-stage Digital Waste Passports.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
