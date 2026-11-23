@@ -74,6 +74,7 @@ import {
   verifyPasswordAsync,
   signSessionToken,
   revokeSessionToken,
+  revokeOpaqueBearerToken,
   generatePassportCode,
   generateReservationCode,
 } from './src/lib/auth-utils.ts';
@@ -686,7 +687,13 @@ app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res) => {
   try {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
-    const revoked = token.startsWith('ouro.') ? await revokeSessionToken(token) : false;
+    let revoked = false;
+    if (token.startsWith('ouro.')) {
+      revoked = await revokeSessionToken(token);
+    } else if (token) {
+      await revokeOpaqueBearerToken(token, 3600);
+      revoked = true;
+    }
     logStructured('info', 'user_logout', { userId: req.authUser!.id, revoked });
     return res.json({ ok: true, revoked });
   } catch (error) {

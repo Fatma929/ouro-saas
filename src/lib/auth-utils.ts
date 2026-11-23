@@ -117,6 +117,20 @@ export async function isSessionTokenRevoked(token: string, payload?: SessionPayl
   return marker !== null;
 }
 
+/**
+ * Revokes an external bearer token (e.g. Firebase ID token) in the shared CacheProvider until expiry.
+ */
+export async function revokeOpaqueBearerToken(token: string, ttlSeconds = 3600): Promise<void> {
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  await getCacheProvider().set(`${REVOKED_TOKEN_PREFIX}ext:${hash}`, '1', Math.max(60, ttlSeconds));
+}
+
+export async function isOpaqueBearerTokenRevoked(token: string): Promise<boolean> {
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  const marker = await getCacheProvider().get(`${REVOKED_TOKEN_PREFIX}ext:${hash}`);
+  return marker !== null;
+}
+
 export function generatePassportCode(): string {
   const year = new Date().getFullYear();
   const suffix = crypto.randomBytes(3).toString('hex').toUpperCase();

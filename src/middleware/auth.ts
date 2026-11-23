@@ -1,7 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
 import { eq } from 'drizzle-orm';
-import { adminAuth } from '../lib/firebase-admin.ts';
-import { isSessionTokenRevoked, verifySessionToken } from '../lib/auth-utils.ts';
+import { adminAuth, hasFirebaseAdminServiceAccount } from '../lib/firebase-admin.ts';
+import {
+  isOpaqueBearerTokenRevoked,
+  isSessionTokenRevoked,
+  verifySessionToken,
+} from '../lib/auth-utils.ts';
 import { db } from '../db/index.ts';
 import { users } from '../db/schema.ts';
 import type { UserRole } from '../shared/constants.ts';
@@ -160,7 +164,34 @@ export async function resolveUserFromBearer(authHeader?: string): Promise<Authen
     };
   }
 
-  const decoded = await adminAuth.verifyIdToken(token, true);
+  if (await isOpaqueBearerTokenRevoked(token)) {
+    return null;
+  }
+
+  let decoded;
+  if (hasFirebaseAdminServiceAccount) {
+    try {
+      decoded = await adminAuth.verifyIdToken(token, true);
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      const msg = String(err?.message || '');
+      const isIdentityToolkitPermissionError =
+        code === 'auth/internal-error' &&
+        (msg.includes('identitytoolkit.googleapis.com') ||
+          msg.includes('403') ||
+          msg.includes('PERMISSION_DENIED') ||
+          msg.includes('SERVICE_DISABLED'));
+      if (!isIdentityToolkitPermissionError) {
+        throw err;
+      }
+      // Fall back to full RS256 cryptographic JWT verification against Google's public x509 certs
+      decoded = await adminAuth.verifyIdToken(token, false);
+    }
+  } else {
+    // Cryptographically verify RS256 signature, issuer, audience (firebase projectId), and expiration
+    // using Google's public x509 certificates without requiring Identity Toolkit IAM credentials.
+    decoded = await adminAuth.verifyIdToken(token, false);
+  }
   const email = (decoded.email || `${decoded.uid}@ouro.eco`).toLowerCase();
   const u = await syncFirebaseUser({
     uid: decoded.uid,

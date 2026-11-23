@@ -12,11 +12,13 @@ import {
   Lock,
   CheckCircle2,
   FileText,
+  ChevronDown,
 } from 'lucide-react';
 import { auth, googleAuthProvider } from '../lib/firebase.ts';
 import { apiFetch, setAuthToken } from '../lib/api.ts';
 import { OuroLogo } from './OuroLogo.tsx';
 import { PWAInstallButton } from './PWAInstallButton.tsx';
+import { TechnologyShowcase } from './TechnologyShowcase.tsx';
 import {
   GOVERNORATES,
   FACILITY_TYPE_LABELS,
@@ -231,6 +233,27 @@ export const PortalAuth: React.FC<PortalAuthProps> = ({
     );
   };
 
+  const handleSelectPortalRole = (role: UserRole, mode: 'login' | 'register' = 'login') => {
+    setSelectedRole(role);
+    setAuthMode(
+      mode === 'register' && (role === 'factory_procurement' || role === 'generator_ops')
+        ? 'register'
+        : 'login'
+    );
+    setError(null);
+    const portalEl = document.getElementById('portal-access');
+    if (portalEl) {
+      portalEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
+  const scrollToShowcase = () => {
+    const el = document.getElementById('intelligence-layers');
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
   const identifierLabel =
     selectedRole === 'generator_ops'
       ? t.auth.identifierGenerator
@@ -251,7 +274,15 @@ export const PortalAuth: React.FC<PortalAuthProps> = ({
       {/* Top Bar */}
       <header className="w-full max-w-7xl mx-auto px-6 py-5 flex items-center justify-between gap-4 border-b border-white/8">
         <OuroLogo variant="light" size="md" />
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2.5 sm:gap-4">
+          <button
+            type="button"
+            onClick={scrollToShowcase}
+            className="hidden md:inline-flex items-center gap-1.5 text-xs font-semibold text-[#CBD2D3] hover:text-[#FBFCFD] transition-colors whitespace-nowrap"
+          >
+            <span>{lang === 'en' ? 'Five Intelligence Layers' : 'طبقات التكنولوجيا الخمس'}</span>
+            <ChevronDown className="w-3.5 h-3.5 text-[#C4A87E]" />
+          </button>
           <PWAInstallButton variant="dark" />
           <button
             type="button"
@@ -265,7 +296,10 @@ export const PortalAuth: React.FC<PortalAuthProps> = ({
       </header>
 
       {/* Main Split Portal Layout */}
-      <main className="w-full max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch flex-1">
+      <main
+        id="portal-access"
+        className="w-full max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch flex-1 scroll-mt-4"
+      >
         {/* Left Brand Context Column */}
         <section className="lg:col-span-5 flex flex-col justify-between gap-6 py-1">
           <div className="space-y-5">
@@ -312,6 +346,21 @@ export const PortalAuth: React.FC<PortalAuthProps> = ({
                 <p className="text-xs font-medium text-[#9EA3A4]">ESG Accounting</p>
                 <p className="text-sm font-semibold text-[#68A899]">EPA WARM v16 / IPCC</p>
               </div>
+            </div>
+
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={scrollToShowcase}
+                className="inline-flex items-center gap-2 text-xs font-semibold text-[#C4A87E] hover:text-[#FBFCFD] transition-colors whitespace-nowrap"
+              >
+                <span>
+                  {lang === 'en'
+                    ? 'Explore One Platform. Five Intelligence Layers.'
+                    : 'استكشف: منصة واحدة. خمس طبقات للذكاء التشغيلي.'}
+                </span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
@@ -885,7 +934,10 @@ export const PortalAuth: React.FC<PortalAuthProps> = ({
         </section>
       </main>
 
-      <footer className="w-full max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-2 text-xs text-[#9EA3A4] border-t border-white/8">
+      {/* Platform Technology Showcase — Five Intelligence Layers */}
+      <TechnologyShowcase lang={lang} onSelectPortalRole={handleSelectPortalRole} />
+
+      <footer className="w-full max-w-7xl mx-auto px-6 py-5 flex flex-wrap items-center justify-between gap-2 text-xs text-[#9EA3A4] border-t border-white/8">
         <span>© {new Date().getFullYear()} OURO Circular Economy Platform · Egypt & MENA</span>
         <span>Non-Hazardous Recyclables · Certified 3PL Chain of Custody</span>
       </footer>
