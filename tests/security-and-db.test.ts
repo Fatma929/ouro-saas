@@ -297,3 +297,122 @@ describe('Phase 3 — CORS, Environment Validation, File ACLs & Sanitization', (
     expect(indexes.length).toBe(17);
   });
 });
+
+describe('Phase 3 Final — Live Security Test Safety Guard & Database Reliability', () => {
+  it('defaults live security tests to local and unconditionally refuses production environments or URLs', async () => {
+    const { assertSafeSecurityTestTarget, SecurityTestSafetyError } = await import(
+      '../src/lib/test-safety.ts'
+    );
+
+    // Default local target succeeds
+    const localDefault = assertSafeSecurityTestTarget({});
+    expect(localDefault.targetClass).toBe('local');
+    expect(localDefault.baseUrl).toBe('http://127.0.0.1:3000');
+
+    // NODE_ENV=production refused even against localhost
+    expect(() =>
+      assertSafeSecurityTestTarget({ NODE_ENV: 'production', QA_BASE_URL: 'http://127.0.0.1:3000' })
+    ).toThrow(SecurityTestSafetyError);
+
+    // Production hostname refused EVEN IF staging opt-in flags are both forced true
+    expect(() =>
+      assertSafeSecurityTestTarget({
+        NODE_ENV: 'development',
+        OURO_SECURITY_TEST_MODE: 'staging',
+        OURO_ALLOW_SHARED_STAGING_TESTS: 'true',
+        QA_BASE_URL: 'https://app.ouro-circular.com',
+      })
+    ).toThrow(/unconditionally forbidden against production/i);
+
+    expect(() =>
+      assertSafeSecurityTestTarget({
+        NODE_ENV: 'development',
+        OURO_SECURITY_TEST_MODE: 'staging',
+        OURO_ALLOW_SHARED_STAGING_TESTS: 'true',
+        QA_BASE_URL: 'https://prod.ouro.example',
+      })
+    ).toThrow(SecurityTestSafetyError);
+
+    // Non-local staging target refused without BOTH opt-in variables
+    expect(() =>
+      assertSafeSecurityTestTarget({
+        NODE_ENV: 'development',
+        QA_BASE_URL: 'https://staging.ouro-circular.example',
+      })
+    ).toThrow(/OURO_ALLOW_SHARED_STAGING_TESTS=true/i);
+
+    // Non-local staging target allowed ONLY with explicit dual opt-in
+    const stagingOk = assertSafeSecurityTestTarget({
+      NODE_ENV: 'development',
+      OURO_SECURITY_TEST_MODE: 'staging',
+      OURO_ALLOW_SHARED_STAGING_TESTS: 'true',
+      QA_BASE_URL: 'https://staging.ouro-circular.example',
+    });
+    expect(stagingOk.targetClass).toBe('staging');
+    expect(stagingOk.baseUrl).toBe('https://staging.ouro-circular.example');
+  });
+
+  it('validates database pool limits, produces actionable credential-redacted errors, and closes pools cleanly', async () => {
+    const {
+      buildPostgresPoolConfig,
+      formatActionableDatabaseError,
+      createDatabaseProvider,
+    } = await import('../src/infra/database.ts');
+    const { InfraConfigurationError } = await import('../src/infra/config.ts');
+
+    // Missing DB target rejected explicitly
+    expect(() =>
+      buildPostgresPoolConfig({
+        port: 5432,
+        sslMode: 'disable',
+        poolMax: 10,
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 15_000,
+      })
+    ).toThrow(InfraConfigurationError);
+
+    // Out-of-range poolMax rejected explicitly
+    expect(() =>
+      buildPostgresPoolConfig({
+        host: '127.0.0.1',
+        port: 5432,
+        sslMode: 'disable',
+        poolMax: 0,
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 15_000,
+      })
+    ).toThrow(/DB_POOL_MAX/);
+
+    // Actionable errors redact secrets and explain operator recovery steps
+    const refused = formatActionableDatabaseError({ code: 'ECONNREFUSED', message: 'connect ECONNREFUSED' });
+    expect(refused.code).toBe('DB_CONNECTION_REFUSED');
+    expect(refused.message).toMatch(/refused the connection/i);
+
+    const authErr = formatActionableDatabaseError({
+      code: '28P01',
+      message: 'password authentication failed for postgres://admin:SuperSecret@db.internal:5432/ouro',
+    });
+    expect(authErr.code).toBe('DB_AUTH_FAILED');
+    expect(authErr.message).not.toContain('SuperSecret');
+
+    // Connection failure against closed port returns structured unhealthy result & closes cleanly
+    const badProvider = createDatabaseProvider({
+      host: '127.0.0.1',
+      port: 1,
+      user: 'ouro',
+      password: 'pw',
+      database: 'ouro',
+      sslMode: 'disable',
+      poolMax: 2,
+      idleTimeoutMillis: 5_000,
+      connectionTimeoutMillis: 800,
+    });
+    const health = await badProvider.healthCheck();
+    expect(health.connected).toBe(false);
+    expect(health.errorCode).toBeTruthy();
+    expect(health.error).toBeTruthy();
+    await badProvider.close();
+    // Idempotent second close succeeds cleanly
+    await badProvider.close();
+  });
+});

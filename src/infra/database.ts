@@ -1,5 +1,9 @@
 import { Pool, type PoolConfig } from 'pg';
-import { resolveInfraConfig, type DatabaseConfig } from './config.ts';
+import {
+  InfraConfigurationError,
+  resolveInfraConfig,
+  type DatabaseConfig,
+} from './config.ts';
 import { logger } from './logger.ts';
 
 export interface DatabaseHealthResult {
@@ -8,6 +12,7 @@ export interface DatabaseHealthResult {
   connectionMode: 'connection_string' | 'unix_socket' | 'tcp_params';
   sslMode: DatabaseConfig['sslMode'];
   poolMax: number;
+  errorCode?: string;
   error?: string;
 }
 
@@ -25,6 +30,99 @@ export interface DatabaseProvider {
 }
 
 /**
+ * Classifies PostgreSQL connection errors into safe, actionable operator diagnostics
+ * without leaking credentials, passwords, or connection strings.
+ */
+export function formatActionableDatabaseError(err: unknown): { code: string; message: string } {
+  const anyErr = err as { code?: string; message?: string } | null;
+  const rawCode = String(anyErr?.code || '').trim();
+  const rawMessage = String(anyErr?.message || 'Unknown database error');
+  // Strip any embedded credentials from connection URLs if present in driver error strings
+  const sanitized = rawMessage.replace(/postgres(?:ql)?:\/\/[^\s]+/gi, 'postgres://<redacted>');
+
+  if (rawCode === 'ECONNREFUSED') {
+    return {
+      code: 'DB_CONNECTION_REFUSED',
+      message: 'PostgreSQL refused the connection. Verify the database server is running and SQL_HOST/SQL_PORT or DATABASE_URL are reachable.',
+    };
+  }
+  if (rawCode === 'ENOTFOUND' || rawCode === 'EAI_AGAIN') {
+    return {
+      code: 'DB_HOST_NOT_FOUND',
+      message: 'PostgreSQL host could not be resolved. Verify DNS/VPC settings and SQL_HOST or DATABASE_URL.',
+    };
+  }
+  if (rawCode === 'ETIMEDOUT' || /timeout/i.test(sanitized)) {
+    return {
+      code: 'DB_CONNECTION_TIMEOUT',
+      message: 'PostgreSQL connection timed out. Check network firewall rules, Cloud SQL Auth Proxy, or DB_CONNECT_TIMEOUT_MS.',
+    };
+  }
+  if (rawCode === '28P01' || rawCode === '28000') {
+    return {
+      code: 'DB_AUTH_FAILED',
+      message: 'PostgreSQL authentication failed. Verify database user and password credentials in Secret Manager or environment.',
+    };
+  }
+  if (rawCode === '3D000') {
+    return {
+      code: 'DB_NOT_FOUND',
+      message: 'Target PostgreSQL database does not exist. Verify SQL_DB_NAME or DATABASE_URL database path.',
+    };
+  }
+  if (/ssl|certificate|self signed/i.test(sanitized)) {
+    return {
+      code: 'DB_TLS_ERROR',
+      message: 'PostgreSQL TLS handshake failed. Verify DB_SSL (disable | require | no-verify) and DB_SSL_CA_CERT.',
+    };
+  }
+  return {
+    code: rawCode || 'DB_CONNECTIVITY_ERROR',
+    message: sanitized,
+  };
+}
+
+/**
+ * Validates pool limits, timeouts, and connectivity target before creating a pg.Pool.
+ */
+export function validateDatabasePoolConfig(cfg: DatabaseConfig): void {
+  if (!cfg.connectionString && !cfg.socketPath && !cfg.host) {
+    throw new InfraConfigurationError(
+      'DB_TARGET_MISSING',
+      'Database connectivity target is missing. Configure DATABASE_URL, DB_SOCKET_PATH, or SQL_HOST.'
+    );
+  }
+  if (!Number.isInteger(cfg.poolMax) || cfg.poolMax < 1 || cfg.poolMax > 100) {
+    throw new InfraConfigurationError(
+      'INVALID_DB_POOL_MAX',
+      `DB_POOL_MAX must be an integer between 1 and 100 (received ${cfg.poolMax}).`
+    );
+  }
+  if (!Number.isInteger(cfg.idleTimeoutMillis) || cfg.idleTimeoutMillis < 1000 || cfg.idleTimeoutMillis > 600_000) {
+    throw new InfraConfigurationError(
+      'INVALID_DB_IDLE_TIMEOUT',
+      `DB_IDLE_TIMEOUT_MS must be an integer between 1000 and 600000 ms (received ${cfg.idleTimeoutMillis}).`
+    );
+  }
+  if (
+    !Number.isInteger(cfg.connectionTimeoutMillis) ||
+    cfg.connectionTimeoutMillis < 500 ||
+    cfg.connectionTimeoutMillis > 120_000
+  ) {
+    throw new InfraConfigurationError(
+      'INVALID_DB_CONNECT_TIMEOUT',
+      `DB_CONNECT_TIMEOUT_MS must be an integer between 500 and 120000 ms (received ${cfg.connectionTimeoutMillis}).`
+    );
+  }
+  if (!cfg.connectionString && !cfg.socketPath && (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535)) {
+    throw new InfraConfigurationError(
+      'INVALID_DB_PORT',
+      `SQL_PORT must be an integer between 1 and 65535 (received ${cfg.port}).`
+    );
+  }
+}
+
+/**
  * Builds a cloud-agnostic node-postgres PoolConfig compatible with:
  * - Standard 12-factor DATABASE_URL (AWS RDS, Neon, Supabase, Render, self-hosted)
  * - Unix domain sockets (Google Cloud SQL Auth Proxy / local Postgres sockets)
@@ -34,6 +132,8 @@ export function buildPostgresPoolConfig(cfg: DatabaseConfig): {
   poolConfig: PoolConfig;
   connectionMode: 'connection_string' | 'unix_socket' | 'tcp_params';
 } {
+  validateDatabasePoolConfig(cfg);
+
   const ssl =
     cfg.sslMode === 'disable'
       ? false
@@ -103,7 +203,11 @@ export function createDatabaseProvider(customConfig?: DatabaseConfig): DatabaseP
     if (!pool) {
       pool = new Pool(poolConfig);
       pool.on('error', (err) => {
-        dbLog.error('postgres_pool_idle_error', { error: err });
+        const formatted = formatActionableDatabaseError(err);
+        dbLog.error('postgres_pool_idle_error', {
+          code: formatted.code,
+          message: formatted.message,
+        });
       });
     }
     return pool;
@@ -122,14 +226,16 @@ export function createDatabaseProvider(customConfig?: DatabaseConfig): DatabaseP
           sslMode: cfg.sslMode,
           poolMax: cfg.poolMax,
         };
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const formatted = formatActionableDatabaseError(err);
         return {
           connected: false,
           latencyMs: Date.now() - started,
           connectionMode,
           sslMode: cfg.sslMode,
           poolMax: cfg.poolMax,
-          error: err?.message || 'Database connectivity check failed',
+          errorCode: formatted.code,
+          error: formatted.message,
         };
       }
     },
@@ -158,4 +264,11 @@ export function getDatabaseProvider(): DatabaseProvider {
     global._ouroDatabaseProvider = createDatabaseProvider();
   }
   return global._ouroDatabaseProvider;
+}
+
+export async function resetDatabaseProviderForTests(): Promise<void> {
+  if (global._ouroDatabaseProvider) {
+    await global._ouroDatabaseProvider.close();
+    global._ouroDatabaseProvider = undefined;
+  }
 }

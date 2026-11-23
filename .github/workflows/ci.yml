@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-typecheck-build:
-    name: Lint, Typecheck & Production Build
+  quality-security-build:
+    name: Lint, Typecheck, Unit/Infra/Security Tests, Audit & Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -20,23 +20,190 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: '22'
-          cache: 'npm'
+          bun-version: '1.4.4'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Clean dependency install (frozen lockfile)
+        run: bun install --frozen-lockfile
 
-      - name: Run TypeScript typecheck & lint
-        run: npm run lint
+      - name: TypeScript typecheck & lint
+        run: bun run lint
+
+      - name: Run infrastructure configuration tests
+        run: bun run test:infra
+
+      - name: Run security configuration & database unit tests
+        run: bun run test:security:config
+
+      - name: Run full Vitest unit & integration test suite
+        run: bun run test:unit
+
+      - name: Print full dependency audit report (informational)
+        run: bun audit || true
+
+      - name: Enforce production dependency security audit gate
+        # Strict gate (no continue-on-error).
+        # Documented exception in SECURITY.md (Review date: 2027-02-22):
+        #   GHSA-m9gg-hp2v-232j (High, transitive @grpc/grpc-js@1.9.16 pinned by @firebase/firestore@4.20.0;
+        #   OURO does not expose gRPC servers; firebase-admin already uses patched @grpc/grpc-js@1.14.7).
+        # Any other high or critical production advisory fails the CI build immediately.
+        run: bun run audit:prod
 
       - name: Build production bundle
         env:
           VITE_APP_ENV: production
-        run: npm run build
+        run: bun run build
 
-      - name: Audit production dependencies
-        continue-on-error: true
-        run: npm audit --omit=dev --audit-level=high
+  integration-db-qa-security:
+    name: Clean DB Migration, Backend API, QA & Live Security Suite
+    runs-on: ubuntu-latest
+    needs: quality-security-build
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ouro_ci
+          POSTGRES_PASSWORD: ouro_ci_password
+          POSTGRES_DB: ouro_ci_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ouro_ci -d ouro_ci_db"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      NODE_ENV: test
+      PORT: '3000'
+      APP_URL: http://127.0.0.1:3000
+      DATABASE_URL: postgres://ouro_ci:ouro_ci_password@127.0.0.1:5432/ouro_ci_db
+      DB_SSL: disable
+      DB_POOL_MAX: '10'
+      STORAGE_PROVIDER: local
+      CACHE_PROVIDER: memory
+      DEPLOYMENT_TOPOLOGY: single-instance
+      EMAIL_PROVIDER: none
+      JOBS_PROVIDER: memory
+      ALLOW_PILOT_SEED: 'true'
+      OURO_SESSION_SECRET: ci-test-session-secret-min-32-characters-long
+      OURO_FILE_SIGN_SECRET: ci-test-file-sign-secret-min-32-characters-long
+      QA_BASE_URL: http://127.0.0.1:3000
+      OURO_SECURITY_TEST_MODE: local
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+
+      - name: Clean dependency install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Apply Drizzle SQL migrations from clean database
+        run: bun run db:migrate
+
+      - name: Start OURO API server in background & verify /api/ready
+        run: |
+          bun server.ts > /tmp/ouro-ci-server.log 2>&1 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/ready | grep -q '"ready":true'; then
+              echo "OURO API is ready."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to become ready. Logs:"
+          cat /tmp/ouro-ci-server.log
+          exit 1
+
+      - name: Verify /api/health and /api/ready responses
+        run: |
+          curl -sf http://127.0.0.1:3000/api/health
+          echo ""
+          curl -sf http://127.0.0.1:3000/api/ready
+          echo ""
+
+      - name: Run full End-to-End QA suite (14 suites)
+        run: bun run test:qa
+
+      - name: Run Phase 3 live security & database verification suite
+        run: bun run test:security:live
+
+      - name: Stop OURO API server cleanly
+        if: always()
+        run: |
+          if [ -n "${SERVER_PID:-}" ]; then
+            kill -TERM "$SERVER_PID" || true
+            wait "$SERVER_PID" || true
+          fi
+
+  docker-build-and-healthcheck:
+    name: Production Docker Image Build & Container Healthcheck
+    runs-on: ubuntu-latest
+    needs: integration-db-qa-security
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build production Docker image
+        run: docker build --build-arg VITE_APP_ENV=production -t ouro-platform:ci .
+
+      - name: Verify Docker container boots and passes /api/ready against isolated PostgreSQL
+        run: |
+          docker network create ouro-ci-net
+          docker run -d --name ouro-ci-pg --network ouro-ci-net \
+            -e POSTGRES_USER=ouro_ci \
+            -e POSTGRES_PASSWORD=ouro_ci_password \
+            -e POSTGRES_DB=ouro_ci_db \
+            postgres:16-alpine
+          for i in $(seq 1 20); do
+            if docker exec ouro-ci-pg pg_isready -U ouro_ci -d ouro_ci_db >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker run -d --name ouro-ci-app --network ouro-ci-net -p 3000:3000 \
+            -e NODE_ENV=production \
+            -e PORT=3000 \
+            -e DATABASE_URL=postgres://ouro_ci:ouro_ci_password@ouro-ci-pg:5432/ouro_ci_db \
+            -e DB_SSL=disable \
+            -e STORAGE_PROVIDER=local \
+            -e CACHE_PROVIDER=memory \
+            -e DEPLOYMENT_TOPOLOGY=single-instance \
+            -e ALLOW_IN_MEMORY_CACHE_IN_PROD=true \
+            -e OURO_SESSION_SECRET=ci-docker-session-secret-at-least-32-chars-long \
+            -e OURO_FILE_SIGN_SECRET=ci-docker-file-sign-secret-at-least-32-chars \
+            ouro-platform:ci
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/ready | grep -q '"ready":true'; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "Docker container failed /api/ready check. Container logs:"
+            docker logs ouro-ci-app
+            exit 1
+          fi
+          echo "Docker container passed /api/ready healthcheck!"
+        shell: bash
+
+      - name: Clean up Docker test containers
+        if: always()
+        run: |
+          docker rm -f ouro-ci-app ouro-ci-pg || true
+          docker network rm ouro-ci-net || true

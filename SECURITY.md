@@ -84,15 +84,16 @@ Every protected endpoint enforces server-side role verification (`requireRole(..
 
 ---
 
-## 6. Dependency Vulnerability Audit (`bun audit`)
+## 6. Dependency Vulnerability Audit & Exception Policy (`bun audit`)
 
-Audited against the workspace lockfile (`bun.lock`) during Phase 3. Observed transitive advisories (5 total: 1 High, 3 Moderate, 1 Low):
+Audited against the committed `bun.lock` lockfile (`bun v1.4.4`). CI enforces a strict, blocking production audit gate (`bun run audit:prod` — **never** `continue-on-error: true`). Any newly introduced high or critical production vulnerability immediately fails CI.
 
-| Package | Version | Severity | Dependency Path | Scope & Mitigation |
-|---|---|---|---|---|
-| `@grpc/grpc-js` | `1.9.16` | High + Low | `firebase` / `firebase-admin` (transitive) | Direct dependencies are already on current majors (`firebase@^13.4.0`, `firebase-admin@^14.5.1`). OURO does not expose gRPC endpoints to untrusted clients; monitor upstream `firebase-admin` patch releases and enforce CI audit checks. |
-| `esbuild` | `0.18.20` | Moderate | `drizzle-kit` (CLI/dev tooling only) | Not bundled into runtime server or frontend builds; dev server is never exposed publicly. |
-| `glob` | `11.1.0` | Moderate | `vite-plugin-pwa -> workbox-build` (build-time only) | Runs only during `vite build` asset bundling; zero runtime exposure in production server or browser. |
-| `minimatch` | `10.2.6` | Moderate | `vite-plugin-pwa -> workbox-build` (build-time only) | Build-time PWA precache matching only; zero runtime exposure to user input. |
+### Observed Transitive Advisories (5 total: 1 High, 3 Moderate, 1 Low)
 
-CI workflow (`.github/workflows/ci.yml`) runs automated dependency auditing (`npm audit --omit=dev --audit-level=high`) on every build to catch newly disclosed runtime vulnerabilities before deployment.
+| Package | Version | Severity | Advisory ID | Dependency Path | Scope, Justification & Review Date |
+|---|---|---|---|---|---|
+| `@grpc/grpc-js` | `1.9.16` | High + Low | `GHSA-m9gg-hp2v-232j` / `GHSA-f596-whhp-79r4` | `firebase > @firebase/firestore-compat > @firebase/firestore@4.20.0 > @grpc/grpc-js@~1.9.0` | **Documented Exception (Review Date: 2027-02-22):** Pinned upstream by `@firebase/firestore@4.20.0` (`bun audit fix` reports blocked by dependent range). Server-side `firebase-admin` already resolves patched `@grpc/grpc-js@1.14.7`, and OURO exposes zero gRPC server endpoints. Explicitly tracked via `--ignore=GHSA-m9gg-hp2v-232j` in `audit:prod` and reviewed quarterly or upon `firebase` SDK release. |
+| `esbuild` | `0.18.20` | Moderate | `GHSA-67mh-4wv8-2f99` | `drizzle-kit > @esbuild-kit/core-utils > esbuild@~0.18.20` | **Dev/CLI Only (Not in Prod Bundle):** Only invoked locally/CI by `drizzle-kit`; production server and Vite build use `esbuild@0.25.12` / `0.28.2` and never expose esbuild dev server. Review Date: 2027-02-22. |
+| `glob` | `11.1.0` | Moderate | `GHSA-3g3m-2fjr-6pw4` | `vite-plugin-pwa > workbox-build@7.4.1 > glob@^11.0.1` | **Build-Time Only (Not in Prod Runtime):** Executed solely during `vite build` PWA precache manifest generation over trusted repository assets. Review Date: 2027-02-22. |
+| `minimatch` | `10.2.6` | Moderate | `GHSA-g3hv-75wg-m249` | `vite-plugin-pwa > workbox-build > glob > minimatch` | **Build-Time Only (Not in Prod Runtime):** Not reachable by external user input at runtime. Review Date: 2027-02-22. |
+

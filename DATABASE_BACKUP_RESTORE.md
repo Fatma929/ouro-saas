@@ -27,9 +27,10 @@ Database engine: **PostgreSQL** managed via **Drizzle ORM** (`src/db/schema.ts`,
    - Locks reservation, passport, and hub (`FOR UPDATE`), enforces strict sequential stage transitions (`scheduled -> accepted -> en_route -> arrived -> picked_up -> delivered`; out-of-order jumps return `409`), requires QR passport match on `picked_up`, validates carrier vehicle ownership, and appends chained `passport_events`.
 4. **Independent 2-Step Stage 7 Verification:**
    - Factory intake (`POST /api/reservations/:id/receive`) and recycling submission (`POST /api/reservations/:id/recycle`) validate mass balance (`recovered + residual + loss <= delivered`) inside transactions while keeping Stage 6 `DELIVERED` and `verified_co2e_tons = 0` until a Platform Admin approves via `POST /api/admin/reservations/:id/verify-recycling`.
-5. **Connection Pooling (`src/infra/database.ts`):**
+5. **Connection Pooling & Validation (`src/infra/database.ts`):**
    - Cloud-agnostic PostgreSQL pool supporting `DATABASE_URL`, Cloud SQL Unix sockets (`DB_SOCKET_PATH`), or discrete `SQL_HOST`/`SQL_PORT`/`SQL_DB_NAME`/`SQL_USER`/`SQL_PASSWORD` credentials.
-   - Configurable pool limits (`DB_POOL_MAX`, `DB_IDLE_TIMEOUT_MS`, `DB_CONNECT_TIMEOUT_MS`), TLS modes (`disable | require | no-verify` + optional `DB_SSL_CA_CERT`), and graceful `SIGINT`/`SIGTERM` pool drain.
+   - Strict startup/pool validation (`validateDatabasePoolConfig`) rejecting out-of-range pool sizes (`1..100`), idle timeouts (`1000..600000 ms`), connection timeouts (`500..120000 ms`), or missing connection targets.
+   - Actionable, secret-redacted error diagnostics (`formatActionableDatabaseError`) for `ECONNREFUSED`, DNS, timeout, auth (`28P01`), missing DB (`3D000`), and TLS failures, plus idempotent graceful pool drain on `SIGINT`/`SIGTERM`.
 
 ---
 
@@ -38,22 +39,22 @@ Database engine: **PostgreSQL** managed via **Drizzle ORM** (`src/db/schema.ts`,
 1. **Never run destructive push commands in staging or production.** Use versioned Drizzle SQL migrations under `./drizzle/`.
 2. **Generate a new migration after editing `src/db/schema.ts`:**
    ```bash
-   npx drizzle-kit generate --config=src/db/drizzle.config.ts --name <descriptive_change_name>
+   bunx drizzle-kit generate --config=src/db/drizzle.config.ts --name <descriptive_change_name>
    ```
 3. **Review generated SQL before applying:**
    - Verify no unintended `DROP TABLE`, `DROP COLUMN`, or data-truncating `ALTER COLUMN TYPE` statements exist.
    - For high-traffic production tables (`reservations`, `passport_events`, `waste_passports`), add new columns as nullable or with lightweight defaults first, backfill in batches, and add `CREATE INDEX CONCURRENTLY` where lock duration matters.
-4. **Apply migrations against a pre-backed-up target:**
+4. **Apply migrations against a pre-backed-up target (or clean CI/staging database):**
    ```bash
-   npx drizzle-kit migrate --config=src/db/drizzle.config.ts
+   bun run db:migrate
    ```
-   > Note: On an existing database initialized before the baseline migration was tracked in `__drizzle_migrations`, take a verified backup first and record the baseline migration hash in the Drizzle migration journal table before applying incremental `0001+` migrations.
+   > Note: `src/db/drizzle.config.ts` supports both `DATABASE_URL` and discrete `SQL_HOST`/`SQL_PORT`/`SQL_DB_NAME`/`SQL_ADMIN_USER` (or `SQL_USER`)/`SQL_ADMIN_PASSWORD` (or `SQL_PASSWORD`). On an existing database initialized before the baseline migration was tracked in `__drizzle_migrations`, take a verified backup first and record the baseline migration hash in the Drizzle migration journal table before applying incremental `0001+` migrations.
 
 ---
 
 ## 3. Logical Backup Procedures (`pg_dump`)
 
-Logical backups are provider-independent and work identically against local PostgreSQL, Google Cloud SQL, AWS RDS, Neon, or self-hosted PostgreSQL.
+Logical backups are provider-independent and require `postgresql-client` (`pg_dump` / `pg_restore`) on the backup runner host (or a dedicated backup container such as `postgres:16-alpine`). When using discrete `SQL_*` variables instead of `DATABASE_URL`, construct `PGHOST="$SQL_HOST" PGPORT="${SQL_PORT:-5432}" PGUSER="$SQL_USER" PGPASSWORD="$SQL_PASSWORD" PGDATABASE="$SQL_DB_NAME"`.
 
 ### 3.1 Create an Encrypted Custom-Format Logical Backup
 Custom format (`-Fc`) produces a compressed, single-file archive supporting parallel selective restoration (`pg_restore`).

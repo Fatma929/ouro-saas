@@ -88,9 +88,10 @@ describe('Phase 2 — Cloud-Agnostic Configuration Resolver', () => {
     );
   });
 
-  it('safely ignores bare numeric placeholder stubs injected by preview runtimes', () => {
+  it('safely ignores bare numeric placeholder stubs ONLY inside positively identified preview runtime', () => {
     const cfg = resolveInfraConfig({
       NODE_ENV: 'development',
+      K_SERVICE: 'ais-dev-preview123',
       STORAGE_PROVIDER: '212',
       STORAGE_SIGNED_URL_MODE: '213',
       STORAGE_MAX_FILE_BYTES: '214',
@@ -111,10 +112,12 @@ describe('Phase 2 — Cloud-Agnostic Configuration Resolver', () => {
       DB_POOL_MAX: '209',
       DB_IDLE_TIMEOUT_MS: '210',
       DB_CONNECT_TIMEOUT_MS: '211',
+      TRUST_PROXY: '225',
       SERVICE_NAME: '226',
       LOG_LEVEL: '227',
       LOG_FORMAT: '228',
     });
+    expect(cfg.isPreviewRuntime).toBe(true);
     expect(cfg.storage.provider).toBe('local');
     expect(cfg.storage.signedUrlMode).toBe('proxy');
     expect(cfg.storage.maxFileSizeBytes).toBe(8 * 1024 * 1024);
@@ -129,7 +132,81 @@ describe('Phase 2 — Cloud-Agnostic Configuration Resolver', () => {
     expect(cfg.database.socketPath).toBeUndefined();
     expect(cfg.database.sslCaCert).toBeUndefined();
     expect(cfg.database.poolMax).toBe(10);
+    expect(cfg.http.trustProxy).toBe(1);
     expect(cfg.logging.serviceName).toBe('ouro-api');
+  });
+
+  it('preserves legitimate numeric settings faithfully in development, test, staging, and production', () => {
+    for (const envName of ['development', 'test', 'staging', 'production'] as const) {
+      const cfg = resolveInfraConfig({
+        NODE_ENV: envName,
+        PORT: '4000',
+        TRUST_PROXY: '2',
+        SQL_HOST: 'db.internal',
+        SQL_PORT: '6432',
+        DB_POOL_MAX: '25',
+        DB_IDLE_TIMEOUT_MS: '45000',
+        DB_CONNECT_TIMEOUT_MS: '8000',
+        STORAGE_PROVIDER: envName === 'production' ? 's3' : 'local',
+        S3_BUCKET: envName === 'production' ? 'ouro-prod-bucket' : '',
+        STORAGE_MAX_FILE_BYTES: '12582912',
+        CACHE_PROVIDER: envName === 'production' ? 'redis' : 'memory',
+        REDIS_URL: envName === 'production' ? 'rediss://default:pass@redis.internal:6379' : '',
+        REDIS_CONNECT_TIMEOUT_MS: '7500',
+        JOBS_MAX_ATTEMPTS: '5',
+        JOBS_BACKOFF_MS: '1500',
+      });
+      expect(cfg.isPreviewRuntime).toBe(false);
+      expect(cfg.http.port).toBe(4000);
+      expect(cfg.http.trustProxy).toBe(2);
+      expect(cfg.database.port).toBe(6432);
+      expect(cfg.database.poolMax).toBe(25);
+      expect(cfg.database.idleTimeoutMillis).toBe(45_000);
+      expect(cfg.database.connectionTimeoutMillis).toBe(8_000);
+      expect(cfg.storage.maxFileSizeBytes).toBe(12_582_912);
+      expect(cfg.cache.redisConnectTimeoutMs).toBe(7500);
+      expect(cfg.jobs.defaultMaxAttempts).toBe(5);
+      expect(cfg.jobs.defaultBackoffMs).toBe(1500);
+    }
+  });
+
+  it('never treats numeric values as placeholders in production and rejects invalid provider or numeric values explicitly', () => {
+    // Even if preview-like K_SERVICE is present, NODE_ENV=production MUST disable preview stub handling
+    expect(() =>
+      resolveInfraConfig({
+        NODE_ENV: 'production',
+        K_SERVICE: 'ais-dev-preview123',
+        STORAGE_PROVIDER: '212',
+      })
+    ).toThrow(InfraConfigurationError);
+
+    expect(() =>
+      resolveInfraConfig({
+        NODE_ENV: 'production',
+        DATABASE_URL: '222',
+      })
+    ).toThrow(/postgres:\/\//i);
+
+    expect(() =>
+      resolveInfraConfig({
+        NODE_ENV: 'production',
+        SQL_PORT: 'not-a-port',
+      })
+    ).toThrow(InfraConfigurationError);
+
+    expect(() =>
+      resolveInfraConfig({
+        NODE_ENV: 'production',
+        DB_POOL_MAX: '500',
+      })
+    ).toThrow(/out of allowed range/i);
+
+    expect(() =>
+      resolveInfraConfig({
+        NODE_ENV: 'production',
+        TRUST_PROXY: 'invalid',
+      })
+    ).toThrow(InfraConfigurationError);
   });
 });
 
@@ -470,12 +547,21 @@ describe('Phase 2 — Cache & Rate Limiting (Memory + Redis + Production Multi-I
       })
     ).toThrow(/valid redis:\/\/ or rediss:\/\//);
 
-    // Local dev ignores non-URL placeholder without crashing
-    const devWithPlaceholder = resolveInfraConfig({
+    // Standard dev explicitly rejects malformed REDIS_URL instead of silently ignoring it
+    expect(() =>
+      resolveInfraConfig({
+        NODE_ENV: 'development',
+        REDIS_URL: 'placeholder-value',
+      })
+    ).toThrow(/valid redis:\/\/ or rediss:\/\//);
+
+    // Positively identified preview runtime safely ignores injected numeric stub
+    const previewWithStub = resolveInfraConfig({
       NODE_ENV: 'development',
-      REDIS_URL: 'placeholder-value',
+      K_SERVICE: 'ais-dev-preview123',
+      REDIS_URL: '2010',
     });
-    expect(devWithPlaceholder.cache.provider).toBe('memory');
+    expect(previewWithStub.cache.provider).toBe('memory');
   });
 
   it('supports local MemoryCacheProvider for development without Redis', async () => {
